@@ -1,4 +1,4 @@
-# DOOM SSH Arena (MVP)
+# Решение кейса SSH Arena AEZA
 
 Minimal multiplayer SSH game in Go:
 - `cmd/gateway` - SSH entrypoint and terminal renderer
