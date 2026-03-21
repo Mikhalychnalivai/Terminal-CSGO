@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"hack2026mart/internal/game/jsonmap"
 	"hack2026mart/internal/game/protocol"
 	"hack2026mart/internal/game/wad"
 )
@@ -57,6 +58,18 @@ type Player struct {
 
 func NewServer(addr string, roomID string, wadPath string, mapName string) (*Server, error) {
 	baseRoom, err := newRoomFromWAD(roomID, wadPath, mapName)
+	if err != nil {
+		return nil, err
+	}
+	return &Server{
+		addr: addr,
+		room: baseRoom,
+	}, nil
+}
+
+// NewServerFromJSON загружает карту из JSON (doom wed/map*.json), а не из WAD.
+func NewServerFromJSON(addr string, roomID string, jsonPath string) (*Server, error) {
+	baseRoom, err := newRoomFromJSON(roomID, jsonPath)
 	if err != nil {
 		return nil, err
 	}
@@ -187,6 +200,57 @@ func newRoomFromWAD(roomID string, wadPath string, mapName string) (*Room, error
 		walls:     walls,
 		spawns:    spawns,
 		blocked:   blocked,
+		players:   map[string]*Player{},
+	}, nil
+}
+
+func newRoomFromJSON(roomID string, jsonPath string) (*Room, error) {
+	layout, err := jsonmap.Load(jsonPath)
+	if err != nil {
+		return nil, err
+	}
+	width := layout.Width
+	height := layout.Height
+	weapons := []protocol.WeaponSpawn{{Name: "SHOTGUN", X: width / 2, Y: height / 2}}
+	spawns := append([]protocol.GridPoint(nil), layout.Spawns...)
+
+	// Разброс спавнов для JSON включается только явно (не через общий SPAWN_MODE=scatter из compose для WAD).
+	useScatter := strings.EqualFold(strings.TrimSpace(os.Getenv("JSON_USE_SCATTER")), "1")
+	if useScatter {
+		spawnCount := getenvInt("SPAWN_COUNT", 10, 1, 64)
+		spawnMinDist := getenvInt("SPAWN_MIN_DIST", 7, 1, 50)
+		symmetry := strings.ToLower(strings.TrimSpace(os.Getenv("SPAWN_SYMMETRY")))
+		if symmetry == "" {
+			symmetry = "4"
+		}
+		seed := roomSeed(roomID)
+		scattered := scatterSpawns(layout.Blocked, width, height, spawnCount, spawnMinDist, seed, symmetry)
+		if len(scattered) > 0 {
+			spawns = scattered
+		}
+	}
+
+	if len(spawns) == 0 {
+		spawns = []protocol.GridPoint{{X: width / 2, Y: height / 2}}
+	}
+
+	walls := append([]protocol.GridPoint(nil), layout.Walls...)
+
+	log.Printf("json map loaded room=%s file=%s title=%s size=%dx%d wallCells=%d spawns=%d json_scatter=%v",
+		roomID, jsonPath, layout.Title, width, height, len(walls), len(spawns), useScatter)
+
+	return &Room{
+		id:        roomID,
+		width:     width,
+		height:    height,
+		mapTitle:  layout.Title,
+		wallTex:   layout.WallTex,
+		ceilFlat:  layout.Ceiling,
+		floorFlat: layout.Floor,
+		weapons:   weapons,
+		walls:     walls,
+		spawns:    spawns,
+		blocked:   layout.Blocked,
 		players:   map[string]*Player{},
 	}, nil
 }

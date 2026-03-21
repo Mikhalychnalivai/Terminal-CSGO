@@ -29,7 +29,7 @@ type MapData struct {
 	Vertices []Vertex
 	Things   []Thing
 	LineDefs []LineDef
-	// WallTexture is a patch name from first valid SIDEDEF middle (shooter 8-char name).
+	// WallTexture is a patch name from first valid SIDEDEF middle (Doom 8-char name).
 	WallTexture string
 	CeilingFlat string
 	FloorFlat   string
@@ -133,6 +133,7 @@ func LoadMap(path string, mapName string) (*MapData, error) {
 }
 
 func extractTextures(sidedefData, sectorData []byte) (wall, ceil, floor string) {
+	// First valid middle texture from sidedefs.
 	for i := 0; i+30 <= len(sidedefData); i += 30 {
 		mid := strings.TrimRight(string(sidedefData[i+20:i+28]), "\x00 ")
 		if mid != "" && mid != "-" {

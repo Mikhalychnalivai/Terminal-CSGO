@@ -22,6 +22,8 @@ type manager struct {
 
 type roomRequest struct {
 	RoomID string `json:"room_id"`
+	// MapID: "1" / "map1" — map1.json, "2" / "map2" — map2.json, "wad" — карта из DOOM.WAD (WAD_MAP).
+	MapID string `json:"map_id"`
 }
 
 type roomResponse struct {
@@ -31,7 +33,7 @@ type roomResponse struct {
 
 func main() {
 	m := &manager{
-		roomImage: getenv("ROOM_IMAGE", "shooter-ssh-arena:latest"),
+		roomImage: getenv("ROOM_IMAGE", "doom-ssh-arena:latest"),
 		network:   getenv("DOCKER_NETWORK", "hack2026mart_default"),
 		wadMap:    getenv("WAD_MAP", "E1M2"),
 	}
@@ -61,7 +63,7 @@ func (m *manager) handleCreate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	addr, err := m.ensureRoom(req.RoomID)
+	addr, err := m.ensureRoom(req.RoomID, req.MapID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -87,40 +89,74 @@ func (m *manager) handleGet(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, roomResponse{RoomID: req.RoomID, Addr: addr})
 }
 
-func (m *manager) ensureRoom(roomID string) (string, error) {
+func (m *manager) ensureRoom(roomID string, mapID string) (string, error) {
 	name := roomContainerName(roomID)
 	exists, _, err := inspectContainer(name)
 	if err != nil {
 		return "", err
 	}
 	if exists {
+		// "Create room" should always provide a fresh room from current image/version.
 		if _, err := runDocker("rm", "-f", name); err != nil {
 			return "", fmt.Errorf("remove old room: %w", err)
 		}
 	}
 
 	tickMS := getenv("ROOM_TICK_MS", "16")
-	spawnMode := getenv("SPAWN_MODE", "scatter")
 	spawnCount := getenv("SPAWN_COUNT", "10")
 	spawnMinDist := getenv("SPAWN_MIN_DIST", "7")
 	spawnSymmetry := getenv("SPAWN_SYMMETRY", "4")
-	_, err = runDocker(
+
+	mapID = strings.ToLower(strings.TrimSpace(mapID))
+	if mapID == "" {
+		mapID = getenv("DEFAULT_MAP_ID", "1")
+	}
+
+	args := []string{
 		"create",
 		"--name", name,
 		"--network", m.network,
 		"--restart", "unless-stopped",
 		"-e", "ROOM_ADDR=:7000",
-		"-e", "ROOM_ID="+roomID,
-		"-e", "WAD_PATH=/assets/SHOOTER.WAD",
-		"-e", "WAD_MAP="+m.wadMap,
-		"-e", "ROOM_TICK_MS="+tickMS,
-		"-e", "SPAWN_MODE="+spawnMode,
-		"-e", "SPAWN_COUNT="+spawnCount,
-		"-e", "SPAWN_MIN_DIST="+spawnMinDist,
-		"-e", "SPAWN_SYMMETRY="+spawnSymmetry,
-		m.roomImage,
-		"/usr/local/bin/room",
-	)
+		"-e", "ROOM_ID=" + roomID,
+		"-e", "ROOM_TICK_MS=" + tickMS,
+		"-e", "SPAWN_COUNT=" + spawnCount,
+		"-e", "SPAWN_MIN_DIST=" + spawnMinDist,
+		"-e", "SPAWN_SYMMETRY=" + spawnSymmetry,
+	}
+
+	switch mapID {
+	case "wad", "doom":
+		// классическая карта из WAD
+		spawnMode := getenv("SPAWN_MODE", "scatter")
+		args = append(args,
+			"-e", "WAD_PATH=/assets/DOOM.WAD",
+			"-e", "WAD_MAP="+m.wadMap,
+			"-e", "SPAWN_MODE="+spawnMode,
+		)
+	case "1", "map1":
+		args = append(args,
+			"-e", "JSON_MAP_PATH=/assets/maps/map1.json",
+			// Для JSON не используем общий SPAWN_MODE=scatter из compose (он для WAD): спавны из Start/End,
+			// разброс только если JSON_USE_SCATTER=1 (см. appendJSONScatterEnv).
+			"-e", "SPAWN_MODE=from_map",
+		)
+		args = appendJSONMapEnv(args)
+		args = appendJSONScatterEnv(args)
+	case "2", "map2":
+		args = append(args,
+			"-e", "JSON_MAP_PATH=/assets/maps/map2.json",
+			"-e", "SPAWN_MODE=from_map",
+		)
+		args = appendJSONMapEnv(args)
+		args = appendJSONScatterEnv(args)
+	default:
+		return "", fmt.Errorf("unknown map_id: use 1, 2, map1, map2 or wad")
+	}
+
+	args = append(args, m.roomImage, "/usr/local/bin/room")
+
+	_, err = runDocker(args...)
 	if err != nil {
 		return "", fmt.Errorf("create room: %w", err)
 	}
@@ -186,6 +222,7 @@ func decodeReq(r *http.Request) (roomRequest, error) {
 	if req.RoomID == "" {
 		req.RoomID = "arena"
 	}
+	req.MapID = strings.TrimSpace(req.MapID)
 	return req, nil
 }
 
@@ -200,4 +237,31 @@ func getenv(k, fallback string) string {
 		return fallback
 	}
 	return v
+}
+
+// appendJSONMapEnv прокидывает опции разбора JSON (масштаб клетки, переворот Y) в room.
+func appendJSONMapEnv(args []string) []string {
+	if v := strings.TrimSpace(os.Getenv("JSON_MAP_FLIP_Y")); v != "" {
+		args = append(args, "-e", "JSON_MAP_FLIP_Y="+v)
+	}
+	if v := strings.TrimSpace(os.Getenv("JSON_MAP_SCALE")); v != "" {
+		args = append(args, "-e", "JSON_MAP_SCALE="+v)
+	}
+	return args
+}
+
+// appendJSONScatterEnv: разброс спавнов на JSON-карте — только если явно задано.
+// JSON_SPAWN_MODE=scatter или JSON_USE_SCATTER=1 у room-manager → JSON_USE_SCATTER=1 в room.
+func appendJSONScatterEnv(args []string) []string {
+	scatter := false
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("JSON_USE_SCATTER")), "1") {
+		scatter = true
+	}
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("JSON_SPAWN_MODE")), "scatter") {
+		scatter = true
+	}
+	if scatter {
+		args = append(args, "-e", "JSON_USE_SCATTER=1")
+	}
+	return args
 }

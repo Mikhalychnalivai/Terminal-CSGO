@@ -1,71 +1,81 @@
 package render
 
-// Встроенный «shooter guy»: шлем/кожа, визор, зелёная броня, чёрное ружьё, сапоги — 8 направлений (билборд).
+// Встроенный морпех: как HUD-пистолет — глиф из lumaChar(яркость), не █ на всё тело.
+// Семантические теги дают разные RGB и дельты яркости (свет/тень), силуэт уже́ и читаемый.
 
-var (
-	marineFrontLines = []string{
-		".......hhh.......",
-		".......vvv.......",
-		"......sdgggds....",
-		".....skkkkkks....",
-		"......dg...gd....",
-		"......bb...bb....",
-	}
-	marineBackLines = []string{
-		".......hhh.......",
-		".......vvv.......",
-		"......dggggd.....",
-		".......gggg......",
-		"......bb...bb....",
-	}
-	marineSideLeftLines = []string{
-		"........hh.......",
-		"........hv.......",
-		".......sgg.......",
-		".......skkk......",
-		".......dgg.......",
-		"........gb.......",
-		".........b.......",
-	}
-	marineQuarter1Lines = []string{
-		".......hhh.......",
-		"......vvvv.......",
-		".....ssdgggg.....",
-		"....sskkkks......",
-		".....dg...g......",
-		".....bb...b......",
-	}
-	marineQuarter3Lines = []string{
-		"........hh.......",
-		".......hvv.......",
-		"......dgggg......",
-		".......sgk.......",
-		"......bb.b.......",
-	}
-)
+func rgbLum(c uint32) int {
+	r := int(byte(c >> 16))
+	g := int(byte(c >> 8))
+	b := int(byte(c))
+	return (r*299 + g*587 + b*114) / 1000
+}
 
-func marinePixel(ch rune) (rune, uint32) {
-	switch ch {
-	case '.', ' ':
+func marineGlyphForTag(tag rune) (rune, uint32) {
+	// Буквенные теги (если есть); иначе — пользовательский ASCII-арт (= * # % …).
+	switch tag {
+	case ' ', '\t':
 		return 0, 0
+	case 'H': // блик шлема
+		c := RGBPacked(232, 200, 150)
+		return lumaChar(clamp(rgbLum(c)+38, 0, 255)), c
 	case 'h': // шлем
-		return '█', RGBPacked(200, 162, 110)
+		c := RGBPacked(198, 158, 105)
+		return lumaChar(clamp(rgbLum(c), 0, 255)), c
+	case 'm': // тень шлема
+		c := RGBPacked(130, 95, 62)
+		return lumaChar(clamp(rgbLum(c)-28, 0, 255)), c
+	case 'V': // блик визора
+		c := RGBPacked(90, 98, 118)
+		return lumaChar(clamp(rgbLum(c)+25, 0, 255)), c
 	case 'v': // визор
-		return '█', RGBPacked(44, 48, 58)
+		c := RGBPacked(40, 44, 54)
+		return lumaChar(clamp(rgbLum(c), 0, 255)), c
+	case 'S': // кожа светлее
+		c := RGBPacked(238, 198, 155)
+		return lumaChar(clamp(rgbLum(c)+22, 0, 255)), c
+	case 's': // кожа
+		c := RGBPacked(212, 168, 128)
+		return lumaChar(clamp(rgbLum(c), 0, 255)), c
+	case 't': // кожа тень
+		c := RGBPacked(165, 118, 85)
+		return lumaChar(clamp(rgbLum(c)-22, 0, 255)), c
+	case 'G': // броня блик
+		c := RGBPacked(60, 220, 95)
+		return lumaChar(clamp(rgbLum(c)+32, 0, 255)), c
 	case 'g': // броня
-		return '█', RGBPacked(0, 156, 48)
-	case 'd': // тень брони
-		return '█', RGBPacked(0, 98, 34)
-	case 's': // кожа рук
-		return '█', RGBPacked(226, 180, 136)
-	case 'k': // ружьё
-		return '█', RGBPacked(20, 20, 26)
-	case 'b': // сапоги
-		return '█', RGBPacked(88, 90, 100)
+		c := RGBPacked(0, 150, 48)
+		return lumaChar(clamp(rgbLum(c), 0, 255)), c
+	case 'd': // броня тень
+		c := RGBPacked(0, 72, 26)
+		return lumaChar(clamp(rgbLum(c)-18, 0, 255)), c
+	case 'K': // ствол / металл
+		c := RGBPacked(72, 72, 78)
+		return lumaChar(clamp(rgbLum(c)+18, 0, 255)), c
+	case 'k': // оружие
+		c := RGBPacked(22, 22, 30)
+		return lumaChar(clamp(rgbLum(c), 0, 255)), c
+	case 'z': // оружие тень
+		c := RGBPacked(12, 12, 16)
+		return lumaChar(clamp(rgbLum(c)-22, 0, 255)), c
+	case 'b': // сапог
+		c := RGBPacked(92, 95, 105)
+		return lumaChar(clamp(rgbLum(c), 0, 255)), c
+	case 'n': // сапог тень
+		c := RGBPacked(58, 60, 68)
+		return lumaChar(clamp(rgbLum(c)-24, 0, 255)), c
 	default:
-		return 0, 0
+		return marineGlyphFromAscii(tag)
 	}
 }
+
+// Заполняется в init() из marine_user_art.go (4 колонки ASCII).
+var (
+	marineFrontLines    []string
+	marineBackLines     []string
+	marineSideLeftLines []string
+	marineQuarter1Lines []string
+	marineQuarter3Lines []string
+)
 
 func parseMarineLayout(lines []string) PistolHUDFrame {
 	h := len(lines)
@@ -92,7 +102,7 @@ func parseMarineLayout(lines []string) PistolHUDFrame {
 			if x < len(rows[y]) {
 				ch = rows[y][x]
 			}
-			r, c := marinePixel(ch)
+			r, c := marineGlyphForTag(ch)
 			fr.Chars[y][x] = r
 			fr.RGB[y][x] = c
 		}
@@ -121,7 +131,7 @@ func flipMarineFrameH(fr PistolHUDFrame) PistolHUDFrame {
 	return out
 }
 
-// BuildBuiltinMarine8 — 8 кадров как у shooter (0 лицом к камере, 4 спиной, 2/6 в профиль).
+// BuildBuiltinMarine8 — 8 кадров как у Doom (0 лицом к камере, 4 спиной, 2/6 в профиль).
 func BuildBuiltinMarine8() [8]PistolHUDFrame {
 	var out [8]PistolHUDFrame
 	front := parseMarineLayout(marineFrontLines)

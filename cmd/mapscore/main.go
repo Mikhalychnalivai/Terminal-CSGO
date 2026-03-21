@@ -10,8 +10,10 @@ import (
 	"hack2026mart/internal/game/wad"
 )
 
+// This utility scores candidate DOOM maps by how symmetric the multiplayer player spawns
+// (THINGS type 1..4) are after projecting into the game's ASCII grid.
 func main() {
-	wadPath := flag.String("wad", "shooter wed/SHOOTER.WAD", "Path to SHOOTER.WAD")
+	wadPath := flag.String("wad", "doom wed/DOOM.WAD", "Path to DOOM.WAD")
 	mapList := flag.String("maps", "E1M1,E1M2,E1M3,E1M4,E1M5,E1M6,E1M7,E1M8,E1M9", "Comma-separated map lump names")
 	flag.Parse()
 
@@ -81,10 +83,12 @@ func formatSpawns(spawns [][2]int) string {
 }
 
 func projectedSpawns(md *wad.MapData, w, h int) [][2]int {
+	// Same grid sizing as internal/game/room.
 	minX, minY, maxX, maxY := bounds(md.Vertices)
 
 	spawns := make([][2]int, 0, 4)
 	for _, t := range md.Things {
+		// In DOOM THINGS, player start types are typically 1..4 in deathmatch.
 		if t.Type < 1 || t.Type > 4 {
 			continue
 		}
@@ -128,13 +132,16 @@ func project(val, srcMin, srcMax, dstMin, dstMax int) int {
 }
 
 func symmetryScore(spawns [][2]int, w, h int) float64 {
-	xSum := (1 + (w - 2))
-	ySum := (1 + (h - 2))
+	// Mirror around the center axes in the projected grid.
+	// x is in [1..w-2], y is in [1..h-2] (inclusive).
+	xSum := (1 + (w - 2))   // e.g. 1+78=79 => mirrorX = xSum - x
+	ySum := (1 + (h - 2))   // e.g. 1+26=27 => mirrorY = ySum - y
 	mirrors := make([][2]int, 0, len(spawns))
 	for _, s := range spawns {
 		mirrors = append(mirrors, [2]int{xSum - s[0], ySum - s[1]})
 	}
 
+	// For each spawn, find the closest spawn to its mirror. Sum squared distance.
 	var sum float64
 	for i := range spawns {
 		mx, my := mirrors[i][0], mirrors[i][1]
@@ -151,3 +158,4 @@ func symmetryScore(spawns [][2]int, w, h int) float64 {
 	}
 	return sum / float64(len(spawns))
 }
+

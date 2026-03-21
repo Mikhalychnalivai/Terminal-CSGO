@@ -3,6 +3,7 @@ package main
 import (
 	"log"
 	"os"
+	"strings"
 
 	"hack2026mart/internal/game/room"
 )
@@ -10,10 +11,19 @@ import (
 func main() {
 	addr := getenv("ROOM_ADDR", ":7000")
 	roomID := getenv("ROOM_ID", "arena")
-	wadPath := getenv("WAD_PATH", "/assets/SHOOTER.WAD")
+	jsonMapPath := strings.TrimSpace(os.Getenv("JSON_MAP_PATH"))
+	wadPath := getenv("WAD_PATH", "/assets/DOOM.WAD")
 	mapName := getenv("WAD_MAP", "E1M2")
 
-	srv, err := room.NewServer(addr, roomID, wadPath, mapName)
+	var srv *room.Server
+	var err error
+	if jsonMapPath != "" {
+		log.Printf("room starting: JSON_MAP_PATH=%s (WAD_MAP ignored)", jsonMapPath)
+		srv, err = room.NewServerFromJSON(addr, roomID, jsonMapPath)
+	} else {
+		log.Printf("room starting: WAD map %s from %s", mapName, wadPath)
+		srv, err = room.NewServer(addr, roomID, wadPath, mapName)
+	}
 	if err != nil {
 		log.Fatalf("room init failed: %v", err)
 	}

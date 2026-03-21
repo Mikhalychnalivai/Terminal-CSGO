@@ -5,7 +5,7 @@ import (
 	"fmt"
 )
 
-// DecodePatch decodes a shooter patch lump into palette-index pixels [y][x]. 0 = transparent.
+// DecodePatch decodes a Doom patch lump into palette-index pixels [y][x]. 0 = transparent.
 func DecodePatch(data []byte) ([][]byte, int, int, error) {
 	if len(data) < 8 {
 		return nil, 0, 0, fmt.Errorf("patch too small")
@@ -45,7 +45,7 @@ func DecodePatch(data []byte) ([][]byte, int, int, error) {
 			if p >= len(data) {
 				break
 			}
-			p++
+			p++ // unused
 			for i := 0; i < length; i++ {
 				if p >= len(data) {
 					break
@@ -57,7 +57,7 @@ func DecodePatch(data []byte) ([][]byte, int, int, error) {
 				p++
 			}
 			if p < len(data) {
-				p++
+				p++ // unused after column
 			}
 		}
 	}

@@ -33,86 +33,90 @@ func Frame(playerID string, snap *protocol.RoomSnapshot, hud GunHUDState, termW 
 	scene := make([][]rune, viewH)
 	colors := make([][]uint32, viewH)
 	half := viewH / 2
+	// Фон за стенами: пустой «небосвод» (без FLAT), пол — спокойный градиент с перспективой.
 	for y := range scene {
 		scene[y] = make([]rune, viewW)
 		colors[y] = make([]uint32, viewW)
 		for x := range scene[y] {
-			if gfx != nil && gfx.Ceiling != nil && y < half {
-				u := float64(x) / float64(viewW)
-				v := float64(y) / float64(half)
-				scene[y][x], colors[y][x] = gfx.SampleFlat(gfx.Ceiling, u, v)
-			} else if gfx != nil && gfx.Floor != nil && y >= half {
-				u := float64(x) / float64(viewW)
-				v := float64(y-half) / float64(viewH-half)
-				scene[y][x], colors[y][x] = gfx.SampleFlat(gfx.Floor, u, v)
-			} else if y < half {
-				scene[y][x] = ceilingShade(y, viewH)
-				colors[y][x] = ceilingColorRGB(y, viewH)
+			if y < half {
+				scene[y][x] = ' '
+				colors[y][x] = voidCeilingColor(y, half)
 			} else {
-				scene[y][x] = floorShade(y, viewH)
-				colors[y][x] = floorColorRGB(y, viewH)
+				scene[y][x] = floorPerspectiveGlyph(y, viewH, half, x, viewW)
+				colors[y][x] = floorPerspectiveColor(y, viewH, half, x, viewW)
 			}
 		}
 	}
 	fov := math.Pi / 3.0
 	maxDist := 48.0
 	distAtCol := make([]float64, viewW)
-	prevDist := maxDist
-	prevWallTop := viewH / 2
-	prevWallBottom := viewH / 2
+	rawDist := make([]float64, viewW)
+	hitSides := make([]bool, viewW)
+	texUs := make([]float64, viewW)
 	for col := 0; col < viewW; col++ {
 		rayAngle := me.Angle - fov/2 + fov*(float64(col)/float64(viewW-1))
-		dist, hitSide, texPhase := castRay(float64(me.X)+0.5, float64(me.Y)+0.5, rayAngle, blocked, maxDist)
+		dist, hitSide, texU := castRay(float64(me.X)+0.5, float64(me.Y)+0.5, rayAngle, blocked, maxDist)
 		corrected := dist * math.Cos(rayAngle-me.Angle)
 		if corrected < 0.001 {
 			corrected = 0.001
 		}
+		rawDist[col] = dist
 		distAtCol[col] = corrected
+		hitSides[col] = hitSide
+		texUs[col] = texU
+	}
+	prevWallTop := viewH / 2
+	prevWallBottom := viewH / 2
+	for col := 0; col < viewW; col++ {
+		dist := rawDist[col]
+		hitSide := hitSides[col]
+		texU := texUs[col]
+		corrected := distAtCol[col]
 		wallH := int(float64(viewH) * 0.9 / corrected)
 		if wallH > viewH {
 			wallH = viewH
 		}
 		top := (viewH - wallH) / 2
 		bottom := top + wallH
-		edge := math.Abs(prevDist-dist) > 1.8 || absInt(top-prevWallTop) > 2 || absInt(bottom-prevWallBottom) > 2
+		jumpL := 0.0
+		if col > 0 {
+			jumpL = math.Abs(rawDist[col] - rawDist[col-1])
+		}
+		jumpR := 0.0
+		if col < viewW-1 {
+			jumpR = math.Abs(rawDist[col] - rawDist[col+1])
+		}
+		edgeL := jumpL > 1.8
+		edgeR := jumpR > 1.8
+		edgeVert := col > 0 && (absInt(top-prevWallTop) > 2 || absInt(bottom-prevWallBottom) > 2)
+		edge := edgeL || edgeR || edgeVert
 		dr := dist / maxDist
-		prevDist = dist
 		prevWallTop = top
 		prevWallBottom = bottom
 		for y := top; y < bottom && y < viewH; y++ {
 			if y >= 0 {
 				var ch rune
 				var wallCol uint32
+				vv := 0.5
+				if bottom-top > 1 {
+					vv = float64(y-top) / float64(bottom-top-1)
+				}
 				if gfx != nil && gfx.OK {
-					vv := 0.5
-					if bottom-top > 1 {
-						vv = float64(y-top) / float64(bottom-top-1)
-					}
-					uu := fractPhase(texPhase*0.11 + float64(col)*0.01)
-					ch, wallCol = gfx.SampleWall(uu, vv, dr, hitSide)
+					uu := fractPhase(texU)
+					var br int
+					wallCol, br = gfx.SampleWall(uu, vv, dr, hitSide)
+					ch = wallDepthGlyph(br, vv, edgeL, edgeR, edgeVert, jumpL, jumpR, hitSide)
 					if edge {
-						ch = '|'
-						wallCol = RGBPacked(240, 240, 240)
+						wallCol = darkenPacked(wallCol, 0.82)
 					}
 				} else {
-					ch = shade(dist, maxDist, hitSide, texPhase)
-					wallCol = wallColorRGB(dist, maxDist, hitSide, edge, texPhase)
-					if edge {
-						ch = '|'
-					}
-					ch = applyVerticalShading(ch, y, top, bottom)
+					lum := wallLumFromRay(dist, maxDist, hitSide, texU)
+					ch = wallDepthGlyph(lum, vv, edgeL, edgeR, edgeVert, jumpL, jumpR, hitSide)
+					wallCol = wallColorRGB(dist, maxDist, hitSide, edge, texU)
 				}
 				scene[y][col] = ch
 				colors[y][col] = wallCol
 			}
-		}
-		if top > 0 && top < viewH {
-			scene[top][col] = '_'
-			colors[top][col] = RGBPacked(120, 200, 220)
-		}
-		if bottom-1 >= 0 && bottom-1 < viewH {
-			scene[bottom-1][col] = '-'
-			colors[bottom-1][col] = RGBPacked(120, 200, 220)
 		}
 	}
 
@@ -123,7 +127,7 @@ func Frame(playerID string, snap *protocol.RoomSnapshot, hud GunHUDState, termW 
 
 	var b strings.Builder
 	b.WriteString("\x1b[2J\x1b[H")
-	b.WriteString(fmt.Sprintf("SHOOTER SSH ARENA FPS | map=%s room=%s\n", snap.MapTitle, snap.RoomID))
+	b.WriteString(fmt.Sprintf("DOOM SSH ARENA FPS | map=%s room=%s\n", snap.MapTitle, snap.RoomID))
 	b.WriteString("Controls: W/S move, A/D turn, SPACE fire, q quit\n\n")
 	writeColoredScene(&b, scene, colors)
 	return b.String()
@@ -138,19 +142,87 @@ func castRay(px, py, angle float64, blocked map[string]struct{}, maxDist float64
 		x := int(math.Floor(hitX))
 		y := int(math.Floor(hitY))
 		if _, ok := blocked[pointKey(x, y)]; ok {
+			// Вертикальная грань сетки (NS): u = позиция вдоль стены по Y.
+			// Горизонтальная (EW): u = позиция по X.
 			hitVertical := x != prevX
-			phase := hitY
-			if !hitVertical {
-				phase = hitX
+			var u float64
+			if hitVertical {
+				u = fractPhase(hitY)
+			} else {
+				u = fractPhase(hitX)
 			}
-			return d, hitVertical, phase
+			return d, hitVertical, u
 		}
 		prevX = x
 	}
 	return maxDist, false, 0
 }
 
-func shade(dist, maxDist float64, vertical bool, phase float64) rune {
+func pointKey(x, y int) string {
+	return fmt.Sprintf("%d:%d", x, y)
+}
+
+// voidCeilingColor — «пустой» небосвод (без символов, только лёгкий градиент к горизонту).
+func voidCeilingColor(y, half int) uint32 {
+	if half < 1 {
+		return RGBPacked(14, 14, 22)
+	}
+	t := float64(half-1-y) / float64(half)
+	if t < 0 {
+		t = 0
+	}
+	if t > 1 {
+		t = 1
+	}
+	r := byte(10 + t*28)
+	g := byte(10 + t*26)
+	b := byte(14 + t*34)
+	return RGBPacked(r, g, b)
+}
+
+func floorPerspectiveGlyph(y, viewH, half, x, viewW int) rune {
+	fh := viewH - half
+	if fh < 1 {
+		return ':'
+	}
+	t := float64(y-half) / float64(fh)
+	off := float64(x)/float64(viewW) + fractPhase(float64(x+y)*0.061)
+	shade := t*0.85 + 0.07*math.Sin(off*6.2831853)
+	lum := int(32 + shade*198)
+	return floorGlyphFromLum(lum)
+}
+
+func floorGlyphFromLum(lum int) rune {
+	if lum < 0 {
+		lum = 0
+	}
+	if lum > 255 {
+		lum = 255
+	}
+	ramp := [...]rune{' ', ' ', ':', ':', ';', '.', ',', ',', '-', '`', '~', '~', '=', '+', '*', '#'}
+	n := len(ramp)
+	step := 255 / (n - 1)
+	i := lum / step
+	if i >= n {
+		i = n - 1
+	}
+	return ramp[i]
+}
+
+func floorPerspectiveColor(y, viewH, half, x, viewW int) uint32 {
+	fh := viewH - half
+	if fh < 1 {
+		return RGBPacked(92, 68, 46)
+	}
+	t := float64(y-half) / float64(fh)
+	off := float64(x) / float64(viewW)
+	r := clamp(int(62+t*98+off*22), 0, 255)
+	g := clamp(int(44+t*78+off*16), 0, 255)
+	b := clamp(int(32+t*52+off*10), 0, 255)
+	return RGBPacked(byte(r), byte(g), byte(b))
+}
+
+func wallLumFromRay(dist, maxDist float64, vertical bool, phase float64) int {
 	r := dist / maxDist
 	if r < 0 {
 		r = 0
@@ -171,45 +243,70 @@ func shade(dist, maxDist float64, vertical bool, phase float64) rune {
 	if lum > 255 {
 		lum = 255
 	}
-	return blockLumaChar(lum)
+	return lum
 }
 
-func pointKey(x, y int) string {
-	return fmt.Sprintf("%d:%d", x, y)
+// wallDepthGlyph — многоступенчатая рампа как в «консольном» Doom: глубина, контур, тень у пола.
+func wallDepthGlyph(br int, vv float64, edgeL, edgeR, edgeVert bool, jumpL, jumpR float64, hitVertical bool) rune {
+	bottomShade := 0.45 + 0.55 * (1.0 - vv)
+	topShade := 0.70 + 0.30 * vv
+	adj := float64(br) * bottomShade * topShade
+	if edgeVert {
+		adj *= 0.84
+	}
+	if edgeL {
+		if jumpL > 3.2 {
+			adj *= 0.44
+		} else {
+			adj *= 0.60
+		}
+	}
+	if edgeR {
+		if jumpR > 3.2 {
+			adj *= 0.70
+		} else {
+			adj *= 0.80
+		}
+	}
+	if hitVertical {
+		adj *= 0.90
+	}
+	lum := int(adj)
+	if lum < 0 {
+		lum = 0
+	}
+	if lum > 255 {
+		lum = 255
+	}
+	if edgeL && jumpL > 2.4 && lum < 105 {
+		return '│'
+	}
+	if edgeR && jumpR > 2.4 && lum < 90 {
+		return '│'
+	}
+	return depthGlyphFromLum(lum)
 }
 
-func ceilingShade(y, h int) rune {
-	r := float64(y) / float64(h/2)
-	if r < 0.20 {
-		return ' '
+func depthGlyphFromLum(lum int) rune {
+	if lum < 0 {
+		lum = 0
 	}
-	if r < 0.35 {
-		return '`'
+	if lum > 255 {
+		lum = 255
 	}
-	if r < 0.50 {
-		return '.'
+	ramp := [...]rune{
+		'█', '█', '█', '▓', '▓', '▓', '▓', '▒', '▒', '▒', '░', '░', '░', '·', '·', ':', ':', ';', '.', '`', ' ',
 	}
-	if r < 0.75 {
-		return ':'
+	n := len(ramp)
+	step := 255 / (n - 1)
+	if step < 1 {
+		step = 1
 	}
-	return ';'
-}
-
-func floorShade(y, h int) rune {
-	r := float64(y-h/2) / float64(h/2)
-	if r < 0.15 {
-		return '.'
+	i := lum / step
+	if i >= n {
+		i = n - 1
 	}
-	if r < 0.30 {
-		return ','
-	}
-	if r < 0.45 {
-		return '-'
-	}
-	if r < 0.65 {
-		return '='
-	}
-	return '~'
+	return ramp[i]
 }
 
 func drawPistol(scene [][]rune, colors [][]uint32, hud GunHUDState, gfx *WadGraphics) {
@@ -232,6 +329,7 @@ func drawPistol(scene [][]rune, colors [][]uint32, hud GunHUDState, gfx *WadGrap
 			}
 			bobY, bobX := walkBobOffsets(hud)
 			yBase += bobY
+			// Чуть левее центра + покачивание при ходьбе.
 			startX := center - cols/2 - 2 + bobX
 			for sy := 0; sy < rows; sy++ {
 				y := yBase + sy
@@ -255,6 +353,7 @@ func drawPistol(scene [][]rune, colors [][]uint32, hud GunHUDState, gfx *WadGrap
 		}
 	}
 
+	// ASCII fallback если в WAD нет спрайтов
 	fi := pistolFrameFromHUD(hud, 4)
 	yBase := h - 4
 	sprite := []string{
@@ -275,7 +374,7 @@ func drawPistol(scene [][]rune, colors [][]uint32, hud GunHUDState, gfx *WadGrap
 		yBase = h - 4
 		sprite[0] = "        __/######\\__        "
 		sprite[1] = "      _/##############\\_    "
-	default:
+	default: // idle
 		yBase = h - 3
 	}
 	bobY, bobX := walkBobOffsets(hud)
@@ -315,7 +414,7 @@ func drawTracer(scene [][]rune, colors [][]uint32, hud GunHUDState) {
 	}
 	w := len(scene[0])
 	cx := w / 2
-	const tracerDrop = 10
+	const tracerDrop = 10 // трасса ниже центра экрана (+2 к прежнему смещению)
 	startY := h/2 + 2 + tracerDrop
 	endY := h/4 + tracerDrop
 	if showMuzzleFlash(hud) {
@@ -376,7 +475,8 @@ func writeColoredScene(sb *strings.Builder, scene [][]rune, colors [][]uint32) {
 
 func wallColorRGB(dist, maxDist float64, vertical bool, edge bool, phase float64) uint32 {
 	if edge {
-		return RGBPacked(245, 245, 245)
+		// Контур — тёмный, не белый (как тень на углу в Doom).
+		return RGBPacked(58, 48, 44)
 	}
 	ratio := dist / maxDist
 	if ratio < 0 {
@@ -385,69 +485,27 @@ func wallColorRGB(dist, maxDist float64, vertical bool, edge bool, phase float64
 	if ratio > 1 {
 		ratio = 1
 	}
-
-	rr := byte(235 - ratio*190)
-	gg := byte(215 - ratio*175)
-	bb := byte(195 - ratio*155)
+	// Тёмная ржаво-коричневая палитра (без WAD), уход в чёрное к дальнему плану.
+	rr := int(112 - ratio*78)
+	gg := int(78 - ratio*58)
+	bb := int(58 - ratio*42)
 	if vertical {
-		rr = byte(float64(rr) * 0.92)
-		gg = byte(float64(gg) * 0.92)
-		bb = byte(float64(bb) * 0.92)
+		rr = int(float64(rr) * 0.88)
+		gg = int(float64(gg) * 0.88)
+		bb = int(float64(bb) * 0.88)
 	}
 	if phase != 0 && int(math.Abs(math.Sin(phase*1.5))*10)%2 == 1 {
-		if rr < 250 {
-			rr += 8
+		if rr < 120 {
+			rr += 5
 		}
-		if gg < 250 {
-			gg += 5
+		if gg < 100 {
+			gg += 4
 		}
 	}
-	return RGBPacked(rr, gg, bb)
-}
-
-func ceilingColorRGB(y, h int) uint32 {
-	r := float64(y) / float64(h/2)
-	switch {
-	case r < 0.25:
-		return RGBPacked(55, 55, 95)
-	case r < 0.50:
-		return RGBPacked(65, 65, 105)
-	case r < 0.75:
-		return RGBPacked(75, 75, 115)
-	default:
-		return RGBPacked(85, 85, 125)
-	}
-}
-
-func floorColorRGB(y, h int) uint32 {
-	r := float64(y-h/2) / float64(h/2)
-	switch {
-	case r < 0.20:
-		return RGBPacked(75, 55, 35)
-	case r < 0.40:
-		return RGBPacked(95, 70, 45)
-	case r < 0.65:
-		return RGBPacked(115, 85, 55)
-	default:
-		return RGBPacked(135, 100, 65)
-	}
-}
-
-func applyVerticalShading(ch rune, y, top, bottom int) rune {
-	if bottom <= top {
-		return ch
-	}
-	r := float64(y-top) / float64(bottom-top)
-	if ch == '|' || ch == '_' || ch == '-' {
-		return ch
-	}
-	if r < 0.15 {
-		return blockLumaChar(35)
-	}
-	if r > 0.85 && ch != ' ' {
-		return blockLumaChar(210)
-	}
-	return ch
+	rr = clamp(rr, 18, 120)
+	gg = clamp(gg, 14, 95)
+	bb = clamp(bb, 12, 78)
+	return RGBPacked(byte(rr), byte(gg), byte(bb))
 }
 
 func absInt(v int) int {
@@ -463,6 +521,19 @@ func fractPhase(x float64) float64 {
 		x += 1
 	}
 	return x
+}
+
+func darkenPacked(col uint32, k float64) uint32 {
+	if k < 0 {
+		k = 0
+	}
+	if k > 1 {
+		k = 1
+	}
+	r := float64(byte(col >> 16))
+	g := float64(byte(col >> 8))
+	b := float64(byte(col))
+	return RGBPacked(byte(r*k), byte(g*k), byte(b*k))
 }
 
 func clamp(v, lo, hi int) int {

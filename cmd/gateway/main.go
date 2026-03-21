@@ -51,7 +51,7 @@ func handleSession(s gossh.Session, managerAddr string) {
 		viewH.Store(42)
 	}
 	io.WriteString(s, "\x1b[2J\x1b[H")
-	io.WriteString(s, "Shooter SSH Arena\n")
+	io.WriteString(s, "DOOM SSH Arena\n")
 	io.WriteString(s, "Enter your nickname: ")
 	name := readLine(input)
 	if name == "" {
@@ -68,12 +68,21 @@ func handleSession(s gossh.Session, managerAddr string) {
 		roomID = "arena"
 	}
 
+	mapID := ""
+	if mode == "1" {
+		io.WriteString(s, "Карта: 1 = map1.json, 2 = map2.json, wad = DOOM.WAD [1]: ")
+		mapID = strings.TrimSpace(readLine(input))
+		if mapID == "" {
+			mapID = "1"
+		}
+	}
+
 	var roomAddr string
 	var err error
 	if mode == "1" {
-		roomAddr, err = managerRequest(managerAddr+"/rooms/create", roomID)
+		roomAddr, err = managerRequest(managerAddr+"/rooms/create", roomID, mapID)
 	} else {
-		roomAddr, err = managerRequest(managerAddr+"/rooms/get", roomID)
+		roomAddr, err = managerRequest(managerAddr+"/rooms/get", roomID, "")
 	}
 	if err != nil {
 		io.WriteString(s, "\n"+err.Error()+"\n")
@@ -124,18 +133,20 @@ func handleSession(s gossh.Session, managerAddr string) {
 	_ = readLine(input)
 
 	var (
-		done           = make(chan struct{})
-		closeOnce      sync.Once
-		fireNano       atomic.Int64
-		gfxMu          sync.Mutex
-		gfx            *render.WadGraphics
-		gfxKey         string
+		done      = make(chan struct{})
+		closeOnce sync.Once
+		fireNano  atomic.Int64 // 0 = нет анимации выстрела; время начала (UnixNano)
+		gfxMu     sync.Mutex
+		gfx       *render.WadGraphics
+		gfxKey    string
+		// Кэш карты: room шлёт walls/weapons только в первом полном state.
 		cachedWalls    []protocol.GridPoint
 		cachedWeapons  []protocol.WeaponSpawn
+		// Для bob при ходьбе: последняя позиция и время последнего шага.
 		lastPX, lastPY int = -1, -1
 		lastMoveNano   int64
 	)
-	wadPath := getenv("WAD_PATH", "/assets/SHOOTER.WAD")
+	wadPath := getenv("WAD_PATH", "/assets/DOOM.WAD")
 	stop := func() {
 		closeOnce.Do(func() { close(done) })
 	}
@@ -277,8 +288,12 @@ func readServerMessage(r *bufio.Reader) (protocol.ServerMessage, error) {
 	return msg, nil
 }
 
-func managerRequest(url string, roomID string) (string, error) {
+// mapID передаётся только при создании комнаты (JSON map1/map2 или wad).
+func managerRequest(url string, roomID string, mapID string) (string, error) {
 	reqBody := map[string]string{"room_id": roomID}
+	if strings.TrimSpace(mapID) != "" {
+		reqBody["map_id"] = strings.TrimSpace(mapID)
+	}
 	b, _ := json.Marshal(reqBody)
 	resp, err := http.Post(url, "application/json", bytes.NewReader(b))
 	if err != nil {

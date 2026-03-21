@@ -19,14 +19,14 @@ type ServerMessage struct {
 }
 
 type RoomSnapshot struct {
-	RoomID   string        `json:"room_id"`
-	Players  []PlayerState `json:"players"`
-	Weapons  []WeaponSpawn `json:"weapons,omitempty"`
-	Walls    []GridPoint   `json:"walls,omitempty"`
-	Width    int           `json:"width"`
-	Height   int           `json:"height"`
-	MapTitle string        `json:"map_title"`
-	// Shooter WAD texture names (from SIDEDEFS / SECTORS) for client-side sampling.
+	RoomID   string         `json:"room_id"`
+	Players  []PlayerState  `json:"players"`
+	Weapons  []WeaponSpawn  `json:"weapons,omitempty"` // пусто = клиент держит последний полный снапшот
+	Walls    []GridPoint    `json:"walls,omitempty"`   // то же (экономия трафика ~сотни KB/тик)
+	Width    int            `json:"width"`
+	Height   int            `json:"height"`
+	MapTitle string         `json:"map_title"`
+	// Doom WAD texture names (from SIDEDEFS / SECTORS) for client-side sampling.
 	WallTexture string `json:"wall_texture,omitempty"`
 	CeilingFlat string `json:"ceiling_flat,omitempty"`
 	FloorFlat   string `json:"floor_flat,omitempty"`
