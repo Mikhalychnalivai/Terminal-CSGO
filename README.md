@@ -1,11 +1,11 @@
 # Решение кейса SSH Arena AEZA
 
-Minimal multiplayer SSH game in Go:
-- `cmd/gateway` - SSH entrypoint and terminal renderer
-- `cmd/room` - realtime room server for one room (one container = one room)
-- `cmd/room-manager` - creates/starts room containers dynamically via Docker API
-- `internal/game/wad` - WAD loader (map, `PLAYPAL`, wall patches, flats)
-- Graphics: **walls** use block glyphs (`█▓▒░…`) + **`PLAYPAL` RGB**; **ceiling/floor** use the classic luma ramp (`@#8&…`). HUD pistol: WAD **`PISGA0`…`PISGD0`**. **Other players**: built-in **Doom-style marine** (helmet/visor, green armor, rifle, boots) with **8 billboard angles**. Truecolor terminal recommended.
+Минимальная многопользовательская SSH-игра на Go:
+- `cmd/gateway` - выступает SSH-точкой входа и терминальным рендерером, 
+- `cmd/room` - реализует realtime-сервер для одной игровой комнаты (один контейнер = одна комната), 
+- `cmd/room-manager` - динамически создаёт и запускает контейнеры комнат через Docker API, 
+- `internal/game/wad` - отвечает за загрузку WAD-файлов (карта, палитра PLAYPAL, патчи стен, плоскости).
+- Графическая часть реализована следующим образом: стены используют блочные символы (█▓▒░…) с RGB-цветами из PLAYPAL, потолок и пол отрисовываются через классическую рампу яркости (@#8&…), HUD с пистолетом использует WAD-спрайты PISGA0…PISGD0, другие игроки отображаются как встроенные морпехи в стиле Doom (шлем/визор, зелёная броня, винтовка, ботинки) с 8 ракурсами billboard, рекомендуется использование truecolor-терминала для полноценной цветопередачи.
 
 ## Requirements
 
