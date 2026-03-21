@@ -1,0 +1,40 @@
+services:
+  room-manager:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: shooter-ssh-arena:latest
+    command: ["/usr/local/bin/room-manager"]
+    environment:
+      MANAGER_ADDR: ":8080"
+      ROOM_IMAGE: "shooter-ssh-arena:latest"
+      DOCKER_NETWORK: "hack2026mart_default"
+      WAD_MAP: "E1M2"
+      SPAWN_MODE: "scatter"
+      SPAWN_COUNT: "10"
+      SPAWN_MIN_DIST: "7"
+      SPAWN_SYMMETRY: "4"
+      ROOM_TICK_MS: "16"
+      DOCKER_HOST: "unix:///var/run/docker.sock"
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock"
+    ports:
+      - "8080:8080"
+    user: "0:0"
+    restart: unless-stopped
+
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: shooter-ssh-arena:latest
+    command: ["/usr/local/bin/gateway"]
+    environment:
+      SSH_LISTEN_ADDR: ":2222"
+      ROOM_MANAGER_ADDR: "http://room-manager:8080"
+      WAD_PATH: "/assets/SHOOTER.WAD"
+    ports:
+      - "2222:2222"
+    depends_on:
+      - room-manager
+    restart: unless-stopped
