@@ -1,7 +1,6 @@
 package render
 
 import (
-	"fmt"
 	"math"
 	"strings"
 
@@ -36,9 +35,6 @@ type WadGraphics struct {
 
 	Ceiling [][]byte
 	Floor   [][]byte
-
-	// Pistol[0]=PISGA0 idle … vanilla order A,B,C,D (fire sequence).
-	Pistol []PistolHUDFrame
 
 	// Player8 — 8 направлений встроенного морпеха (стиль Doom: шлем, визор, броня, ружьё).
 	Player8         [8]PistolHUDFrame
@@ -166,20 +162,6 @@ func LoadWadGraphics(path, wallName, ceilName, floorName string) *WadGraphics {
 		g.Floor = tryFlat("FLOOR5_1")
 	}
 
-	// Doom chaingun replacement pistol: PISGA0–PISGD0 (shareware / registered).
-	for _, name := range []string{"PISGA0", "PISGB0", "PISGC0", "PISGD0"} {
-		data := a.LumpData(strings.ToUpper(name))
-		if len(data) == 0 {
-			data = a.LumpData(name)
-		}
-		if len(data) == 0 {
-			continue
-		}
-		if fr, err := patchToHUD(data, g.Pal, 56, 13); err == nil && fr != nil {
-			g.Pistol = append(g.Pistol, *fr)
-		}
-	}
-
 	g.OK = g.Wall != nil && g.WallH > 0 && g.WallW > 0
 	if g.WallVert == nil || g.WallVertW < 2 {
 		g.WallVert, g.WallVertW, g.WallVertH = g.Wall, g.WallW, g.WallH
@@ -187,90 +169,8 @@ func LoadWadGraphics(path, wallName, ceilName, floorName string) *WadGraphics {
 	return g
 }
 
-// patchToHUD scales a patch into a small HUD bitmap (PLAYPAL RGB + lumaChar, как раньше).
-func patchToHUD(data []byte, pal [256][3]byte, maxW, maxH int) (*PistolHUDFrame, error) {
-	pix, w, h, err := wad.DecodePatch(data)
-	if err != nil || w < 2 || h < 2 {
-		return nil, fmt.Errorf("patch decode")
-	}
-	minX, minY := w, h
-	maxX, maxY := -1, -1
-	for yy := 0; yy < h; yy++ {
-		for xx := 0; xx < w; xx++ {
-			if pix[yy][xx] == 0 {
-				continue
-			}
-			if xx < minX {
-				minX = xx
-			}
-			if xx > maxX {
-				maxX = xx
-			}
-			if yy < minY {
-				minY = yy
-			}
-			if yy > maxY {
-				maxY = yy
-			}
-		}
-	}
-	if maxX < minX || maxY < minY {
-		return nil, fmt.Errorf("empty pistol patch")
-	}
-	bw := maxX - minX + 1
-	bh := maxY - minY + 1
-	scaleW := float64(maxW) / float64(bw)
-	scaleH := float64(maxH) / float64(bh)
-	scale := scaleW
-	if scaleH < scale {
-		scale = scaleH
-	}
-	outW := int(float64(bw) * scale)
-	outH := int(float64(bh) * scale)
-	if outW < 1 {
-		outW = 1
-	}
-	if outH < 1 {
-		outH = 1
-	}
-	if outW > maxW {
-		outW = maxW
-	}
-	if outH > maxH {
-		outH = maxH
-	}
-	fr := &PistolHUDFrame{
-		Chars: make([][]rune, outH),
-		RGB:   make([][]uint32, outH),
-	}
-	for oy := 0; oy < outH; oy++ {
-		fr.Chars[oy] = make([]rune, outW)
-		fr.RGB[oy] = make([]uint32, outW)
-		for ox := 0; ox < outW; ox++ {
-			sx := minX + int((float64(ox)+0.5)/float64(outW)*float64(bw))
-			sy := minY + int((float64(oy)+0.5)/float64(outH)*float64(bh))
-			if sx > maxX {
-				sx = maxX
-			}
-			if sy > maxY {
-				sy = maxY
-			}
-			idx := pix[sy][sx]
-			if idx == 0 {
-				fr.Chars[oy][ox] = 0
-				continue
-			}
-			pr, pg, pb := pal[idx][0], pal[idx][1], pal[idx][2]
-			br := wad.Brightness(pal, idx)
-			fr.Chars[oy][ox] = lumaChar(br)
-			fr.RGB[oy][ox] = RGBPacked(pr, pg, pb)
-		}
-	}
-	return fr, nil
-}
-
 // SampleWall возвращает цвет пикселя из патча WAD и яркость (0–255) для выбора глифа в ascii
-// (рампа символов рисуется в Frame — wallDepthGlyph).
+// (рампа глубины — depthGlyphFromLumJitter в mesh_raster / ascii).
 // verticalHit = true — вертикальная грань сетки (NS); иначе WallVert/освещение как в DOOM.WAD.
 func (g *WadGraphics) SampleWall(u, v float64, distRatio float64, verticalHit bool) (uint32, int) {
 	if !g.OK {
@@ -388,7 +288,7 @@ func clampByte(v int) int {
 	return v
 }
 
-// lumaChar — классическая ASCII-рампа для фона (потолок/пол) и HUD-пистолета.
+// lumaChar — классическая ASCII-рампа для фона (потолок/пол) и спрайтов морпеха.
 func lumaChar(l int) rune {
 	if l < 0 {
 		l = 0

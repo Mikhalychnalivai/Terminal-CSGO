@@ -13,9 +13,13 @@ import (
 // This utility scores candidate DOOM maps by how symmetric the multiplayer player spawns
 // (THINGS type 1..4) are after projecting into the game's ASCII grid.
 func main() {
-	wadPath := flag.String("wad", "doom wed/DOOM.WAD", "Path to DOOM.WAD")
+	wadPath := flag.String("wad", "", "Path to DOOM.WAD (optional utility)")
 	mapList := flag.String("maps", "E1M1,E1M2,E1M3,E1M4,E1M5,E1M6,E1M7,E1M8,E1M9", "Comma-separated map lump names")
 	flag.Parse()
+	if strings.TrimSpace(*wadPath) == "" {
+		fmt.Println("mapscore: pass -wad path/to/DOOM.WAD")
+		return
+	}
 
 	candidates := splitComma(*mapList)
 	type scoreRow struct {

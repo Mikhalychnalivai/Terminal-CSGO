@@ -1,45 +1,69 @@
-# Решение кейса SSH Arena AEZA
+# DOOM SSH Arena (MVP)
 
-Минимальная многопользовательская SSH-игра на Go:
-- `cmd/gateway` - выступает SSH-точкой входа и терминальным рендерером, 
-- `cmd/room` - реализует realtime-сервер для одной игровой комнаты (один контейнер = одна комната), 
-- `cmd/room-manager` - динамически создаёт и запускает контейнеры комнат через Docker API, 
-- `internal/game/wad` - отвечает за загрузку WAD-файлов (карта, палитра PLAYPAL, патчи стен, плоскости).
-- Графическая часть реализована следующим образом: стены используют блочные символы (█▓▒░…) с RGB-цветами из PLAYPAL, потолок и пол отрисовываются через классическую рампу яркости (@#8&…), HUD с пистолетом использует WAD-спрайты PISGA0…PISGD0, другие игроки отображаются как встроенные морпехи в стиле Doom (шлем/визор, зелёная броня, винтовка, ботинки) с 8 ракурсами billboard, рекомендуется использование truecolor-терминала для полноценной цветопередачи.
+Minimal multiplayer SSH game in Go:
+- `cmd/gateway` - SSH entrypoint and terminal renderer
+- `cmd/room` - realtime room server for one room (one container = one room)
+- `cmd/room-manager` - creates/starts room containers dynamically via Docker API
+- `internal/game/wad` - WAD loader (map, `PLAYPAL`, wall patches, flats)
+- Graphics: **walls** use block glyphs (`█▓▒░…`) + **`PLAYPAL` RGB**; **ceiling/floor** use the classic luma ramp (`@#8&…`). HUD: WAD pistol **`PISGA0`…`PISGD0`** или встроенный fallback; отдельный **ASCII-автомат** (справа от центра). **Other players**: built-in **Doom-style marine** (зоны: шлем / броня / оружие / ноги по позиции символа) с **8 billboard angles**. Truecolor terminal recommended.
+
+## Стек (зависимости и компоненты)
+
+**Go (прямые модули)** — в `go.mod` по-прежнему одна зависимость:
+
+- [`github.com/gliderlabs/ssh`](https://github.com/gliderlabs/ssh) — SSH-сервер в `cmd/gateway`.
+
+**Транзитивно** (подтягиваются сами, см. `go.sum`): `github.com/anmitsu/go-shlex`, `golang.org/x/crypto`, `golang.org/x/sys`, `golang.org/x/term`. **Новых пакетов в `require` мы не добавляли** — редактор карт, room-manager API и прочее на стандартной библиотеке и `internal/…`.
+
+**Внутренние пакеты / бинарники (не отдельные модули):**
+
+- `internal/mapedit` — интерактивный редактор сетки (SSH и `cmd/mapbuilder`).
+- `internal/game/jsonmap` — загрузка JSON-карт, `SpawnCells`, масштаб `JSON_MAP_SCALE` (в т.ч. **1** для карт из редактора).
+- `cmd/mapbuilder` — CLI-редактор карты без SSH.
+- Docker: том `doom_ssh_room_maps` для пользовательских JSON при `map_id=custom` (см. `docker-compose.yml`).
 
 ## Requirements
 
 - Docker + Docker Compose
-- `DOOM.WAD` at `doom wed/DOOM.WAD`
-- Карты-редактор: `doom wed/map1.json`, `doom wed/map2.json` (копируются в образ как `/assets/maps/map1.json`, `map2.json`)
+- `DOOM.WAD` at `map/DOOM.WAD`
+- Карта по умолчанию в образе: `map/corridor5.json` → `/assets/maps/corridor5.json`. Свои JSON можно добавить в образ (Dockerfile `COPY`) или смонтировать в контейнер `room` и указать `JSON_MAP_PATH`.
 
 ## Карты JSON и выбор при создании комнаты
 
 При **создании комнаты** через SSH шлюз после ввода `Room ID` спрашивается карта:
 
-- **`1`** или **`map1`** — загрузка `map1.json`
-- **`2`** или **`map2`** — загрузка `map2.json`
-- **`wad`** или **`doom`** — классическая карта из `DOOM.WAD` (как раньше, см. `WAD_MAP` у `room-manager`)
+- **`1`** (Enter) — **`corridor5`** (коридор из пяти комнат), то же что `map_id` **`corridor5`** / **`default`** у `room-manager`.
+- **`2`** — ввести свой **`map_id`**, который понимает `room-manager` (сейчас поддерживаются **`1`**, **`corridor5`**, **`corridor`**, **`default`**, **`map`** — все ведут на `corridor5.json`). Другие имена без файла в образе дадут ошибку при старте `room`.
+- **`3`** — встроенный редактор карты в SSH; карта уходит в `room-manager` как **`custom`** с телом **`map_json`** (нужен том `room_maps` в compose, см. «Стек»).
 
 Через API `room-manager`:
 
 ```json
 POST /rooms/create
-{"room_id": "arena", "map_id": "2"}
+{"room_id": "arena", "map_id": "corridor5"}
 ```
 
-Если `map_id` не указан, по умолчанию берётся **`1`** (переменная окружения `DEFAULT_MAP_ID` у `room-manager`).
+Если `map_id` не указан, по умолчанию берётся **`corridor5`** (переменная окружения `DEFAULT_MAP_ID` у `room-manager`).
 
 Для JSON-карт спавны **по умолчанию из `Start` / `End` в файле**. Общий **`SPAWN_MODE=scatter`** в compose (для карт **WAD**) **на JSON не влияет**. Разброс по карте включается только явно у **`room-manager`**: **`JSON_USE_SCATTER=1`** или **`JSON_SPAWN_MODE=scatter`** (оба пробрасывают в контейнер `room` флаг **`JSON_USE_SCATTER=1`**).
 
-**Если «ничего не менялось»:** чаще всего не пересобран образ (`docker compose up -d --build`), контейнер `room-*` остался старым, или при входе выбран не тот режим карты (нужно **создать комнату** и указать **`1`/`2`**, не `wad`). В логах контейнера `room` после пересборки должна быть строка вида `json map loaded ... title=map1 ...` или `room starting: JSON_MAP_PATH=...`.
+**Если «ничего не менялось»:** чаще всего не пересобран образ (`docker compose up -d --build`), контейнер `room-*` остался старым. В логах `room` после пересборки должна быть строка вида `json map loaded ... title=corridor5 ...` или `room starting: JSON_MAP_PATH=...`.
 
 Формат JSON по смыслу близок к **Wolfenstein 3D (1993)**: сетка клеток, **стена между двумя клетками** задаётся гранями соседей (или цельный блок — все четыре грани «закрыты»). Движок строит коллизии так: цельные кубы стен заливаются целиком, **внутренние** вертикальные/горизонтальные грани — **одной** линией клеток (без дыр и без лишнего дублирования).
 
 Опции (прокинь в `room-manager`, они передаются в контейнер `room` для JSON-карт):
 
-- **`JSON_MAP_SCALE`** — сколько клеток движка на одну клетку редактора (по умолчанию **2**, минимум 2).
+- **`JSON_MAP_SCALE`** — сколько клеток движка на одну клетку редактора (по умолчанию **2**, минимум **1**). Для карт из пункта меню **[3]** `room-manager` сам выставляет **`JSON_MAP_SCALE=1`**, чтобы сетка плана совпадала с коллизией.
 - **`JSON_MAP_FLIP_Y`** — `1`, если карта вверх ногами / спавн не там: переворачивает ось Y как в классической сетке «математика vs экран».
+
+## Производительность и трафик
+
+- **`ROOM_TICK_MS`** (контейнер `room`) — период рассылки `state`, по умолчанию **4** ms (~250 Гц). Больше (например **16–33**) — меньше JSON/сек и нагрузка.
+- **`GATEWAY_RENDER_MS`** (контейнер `gateway`) — интервал отрисовки кадра в SSH, по умолчанию **8** ms (~125 FPS). Снапшоты с room читаются сразу; лимит только на **вывод кадра** в терминал.
+- Компактный `state` без `walls`/`weapons` после первого полного кадра; на клиенте кэш (как раньше).
+- На **room**: один `json.Marshal` на тик на тип сообщения, канал с **coalescing** при отставании клиента.
+
+Если нужно снизить нагрузку на слабом ПК: `GATEWAY_RENDER_MS=16` или `33`, `ROOM_TICK_MS=16` или `25`.
 
 ## Run
 
@@ -57,8 +81,10 @@ ssh -p 2222 any@localhost
 
 - `W` / `S` forward / back
 - `A` / `D` turn
-- `Space` fire (tracer + pistol anim по времени, ~17 кадров/с на серию выстрела)
-- `q` quit
+- `Space` fire (анимация оружия; урон: пистолет **20**, автомат **33**; без патронов в текущей обойме/магазине — нет выстрела и нет анимации огня)
+- `1` / `2` переключение HUD: **автомат** (ASCII) / **пистолет** (WAD `PISG*` или fallback)
+- Слева снизу: **HP** (красным) и **ARM** (синим); спавн **100 HP**, **0 брони**; сначала снимается броня, потом HP
+- После смерти: **`r`** возродиться; **`q`** — выход (и из меню смерти)
 
 Gateway reads `WAD_PATH` (default `/assets/DOOM.WAD` in Docker) for real textures.
 
@@ -95,11 +121,14 @@ powershell -ExecutionPolicy Bypass -File .\scripts\docker-up-no-proxy.ps1
 
 ## Notes
 
-- **Низкая задержка:** тик комнаты по умолчанию **16 ms** (~62 Гц), переменная **`ROOM_TICK_MS`** (8–100) в `room-manager` / env контейнера `room`. **TCP_NODELAY** на связке gateway↔room. **Стены/оружие** в JSON шлются только в **первом** полном `state` на игрока; дальше только позиции — меньше трафика и быстрее отклик по LAN/Wi‑Fi.
-- Если в комнате **один** игрок, в мир добавляется демо-**MARINE** (`__demo_marine__`) впереди по взгляду — чтобы смотреть спрайт без второго клиента.
+- **Визуал мира (клиент):** мир рисуется **3D-мешем** (пол/потолок/стены из треугольников + z-buffer), в духе [Asciipocalypse](https://github.com/wonrzrzeczny/Asciipocalypse) — рампа символов по глубине (fog + дизеринг по пикселю). Это **не** Unity/Unreal **NavMesh** (полигоны для ИИ/пути). Карта приходит с сервера как **сетка стен**; меш строится из неё для картинки (**контуры**, **сетка** на полу/потолке, условный **«кирпич»**, разный оттенок стен по осям). Глубина по колонкам для спрайтов других игроков берётся из того же прохода меша.
+- **Движение и «не клеточка»:** на сервере и в gateway-предикции — пакет `internal/game/nav` (**круг** + **slide** вдоль стен).
+- **Классический NavMesh (2D):** пакет `internal/game/navmesh` — при загрузке комнаты из сетки `blocked` строятся **ось-ориентированные прямоугольники** (покрытие проходимых клеток), соседи = полигоны с общей стороной, **A-star** по графу полигонов. API: **`(*Mesh).FindPath(sx,sy,ex,ey)`**, на комнате — **`(*Room).FindNavPath(...)`** (для ботов, «идти к точке», отладки). **WASD** по-прежнему через **nav** (коллизия), не через «прилипание к пути» — при необходимости можно связать сами.
+- **Низкая задержка:** тик комнаты по умолчанию **4 ms** (~250 Гц), переменная **`ROOM_TICK_MS`** (4–100) в `room-manager` / env контейнера `room`. **TCP_NODELAY** на связке gateway↔room. **Стены/оружие** в JSON шлются только в **первом** полном `state` на игрока; дальше только позиции — меньше трафика и быстрее отклик по LAN/Wi‑Fi. На клиенте gateway — **prediction** (локальный шаг как на сервере) и **сглаживание** к авторитетному state.
+- **Боезапас:** пистолет (**1**) — **10** в обойме, запас **бесконечный** (**R** добивает обойму до 10, анимация ~0,75 с). Автомат (**2**) — **30** + **60** в запасе **только при первом входе в комнату**; после **смерти и респавна** оба слота — как в момент смерти. **R** у живого: перезарядка выбранного оружия (автомат — из запаса, пока магазин &lt; 30; анимация автомата ~1 с). У мёртвого **R** — респавн.
 - Player can create room or join existing room by room ID.
 - On room creation, player auto-joins.
 - Each room is an isolated room container (`room-<room_id>`) managed by `room-manager`.
-- Shared map is loaded from `DOOM.WAD` (`E1M2` by default).
+- Карта по умолчанию в Docker — JSON **corridor5**; при запуске `room` с `WAD_PATH` + `WAD_MAP` загружается уровень из `DOOM.WAD`.
 - Spawns (где появляется игрок): по умолчанию включён `SPAWN_MODE=scatter`, он раскидывает стартовые точки по проходимой зоне карты симметрично. Параметры: `SPAWN_COUNT`, `SPAWN_MIN_DIST`, `SPAWN_SYMMETRY` (например, `4` для зеркальной симметрии).
 - Weapon points are extracted from THINGS lump and rendered as `W`.

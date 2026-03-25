@@ -1,3 +1,8 @@
+volumes:
+  # Общий том для JSON карт: room-manager пишет файл, room монтирует read-only.
+  room_maps:
+    name: doom_ssh_room_maps
+
 services:
   room-manager:
     build:
@@ -9,10 +14,13 @@ services:
       MANAGER_ADDR: ":8080"
       ROOM_IMAGE: "doom-ssh-arena:latest"
       DOCKER_NETWORK: "hack2026mart_default"
-      WAD_MAP: "E1M2"
-      # Спавны: если хочешь "разброс" по зоне карты, включай scatter.
-      # Значения прокидываются в контейнер room через room-manager.
-      SPAWN_MODE: "scatter"
+      # Имя docker volume (см. volumes.room_maps.name) — для карт из SSH-редактора.
+      ROOM_MAPS_DOCKER_VOLUME: "doom_ssh_room_maps"
+      ROOM_MAPS_DIR: "/data/maps"
+      # Карта по умолчанию — corridor5 (см. DEFAULT_MAP_ID / map_id в API).
+      DEFAULT_MAP_ID: "corridor5"
+      # Спавны для JSON: from_map через room-manager; scatter только для WAD (не используется).
+      SPAWN_MODE: "from_map"
       SPAWN_COUNT: "10"
       SPAWN_MIN_DIST: "7"
       SPAWN_SYMMETRY: "4"
@@ -21,6 +29,7 @@ services:
       DOCKER_HOST: "unix:///var/run/docker.sock"
     volumes:
       - "/var/run/docker.sock:/var/run/docker.sock"
+      - "room_maps:/data/maps"
     ports:
       - "8080:8080"
     user: "0:0"
@@ -36,6 +45,8 @@ services:
       SSH_LISTEN_ADDR: ":2222"
       ROOM_MANAGER_ADDR: "http://room-manager:8080"
       WAD_PATH: "/assets/DOOM.WAD"
+      # Частота отрисовки кадра в SSH (8 ≈125 FPS; больше = реже кадры, меньше нагрузка)
+      GATEWAY_RENDER_MS: "8"
     ports:
       - "2222:2222"
     depends_on:

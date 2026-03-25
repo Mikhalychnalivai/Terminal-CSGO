@@ -16,12 +16,12 @@ import (
 	"time"
 
 	"hack2026mart/internal/game/jsonmap"
+	"hack2026mart/internal/game/nav"
+	"hack2026mart/internal/game/navmesh"
 	"hack2026mart/internal/game/protocol"
+	"hack2026mart/internal/game/render"
 	"hack2026mart/internal/game/wad"
 )
-
-// demoPlayerID — фиктивный игрок для превью спрайта (не в таблице players).
-const demoPlayerID = "__demo_marine__"
 
 type Server struct {
 	addr string
@@ -39,19 +39,46 @@ type Room struct {
 	weapons  []protocol.WeaponSpawn
 	walls    []protocol.GridPoint
 	spawns   []protocol.GridPoint
-	blocked  map[string]struct{}
-	players  map[string]*Player
+	blocked map[uint64]struct{}
+	// navMesh — только для A* (FindNavPath), ленивая сборка (navMeshOnce); ходьба — nav+blocked.
+	navMesh     *navmesh.Mesh
+	navMeshOnce sync.Once
+	players     map[string]*Player
+	// killFeed — последние события для килчата (только имена).
+	killFeed []protocol.KillFeedEntry
 	mu       sync.RWMutex
 }
 
 type Player struct {
-	id   string
-	name string
-	x    int
-	y    int
-	angle float64
-	conn net.Conn
-	send chan protocol.ServerMessage
+	id     string
+	name   string
+	x      float64
+	y      float64
+	angle  float64
+	hp     int
+	armor  int
+	dead   bool
+	// ticksSinceMove: после каждого broadcast +1; при успешном шаге = 0. Большое значение = стоит на месте.
+	ticksSinceMove int
+	walkPhase      int // 0..7, +1 за каждый успешный шаг
+	lastFireNano int64
+	// lastHitConfirmNano — время последнего попадания по врагу (для клиентского «попал»).
+	lastHitConfirmNano int64
+	// killedBy — имя игрока, нанёсшего смертельный урон (для UI жертвы).
+	killedBy string
+	// Пистолет: только обойма (запас бесконечен). Автомат: магазин и запас.
+	pistolMag    int
+	rifleMag     int
+	rifleReserve int
+	money        int
+	kills        int
+	deaths       int
+	// echoPingNano — отдать в следующем state клиенту для измерения RTT (после отправки обнуляется).
+	echoPingNano int64
+	// reportedPingMs — последний RTT (мс), прислан клиентом для таблицы у всех.
+	reportedPingMs int
+	conn         net.Conn
+	send   chan []byte // готовая JSON-строка с \n; coalesce — только последний state при переполнении
 	// sendFullMap: следующий state с полными walls/weapons; потом только компактные обновления.
 	sendFullMap bool
 }
@@ -67,7 +94,7 @@ func NewServer(addr string, roomID string, wadPath string, mapName string) (*Ser
 	}, nil
 }
 
-// NewServerFromJSON загружает карту из JSON (doom wed/map*.json), а не из WAD.
+// NewServerFromJSON загружает карту из JSON (каталог map/ в репозитории), а не из WAD.
 func NewServerFromJSON(addr string, roomID string, jsonPath string) (*Server, error) {
 	baseRoom, err := newRoomFromJSON(roomID, jsonPath)
 	if err != nil {
@@ -99,19 +126,35 @@ func (s *Server) Run() error {
 
 func (s *Server) handleConn(conn net.Conn) {
 	defer conn.Close()
-	reader := bufio.NewReader(conn)
+	br := bufio.NewReader(conn)
 
-	line, err := reader.ReadBytes('\n')
+	b0, err := br.Peek(1)
 	if err != nil {
 		return
 	}
-	var hello protocol.ClientMessage
-	if err := json.Unmarshal(line, &hello); err != nil || hello.Type != "join" {
-		writeMsg(conn, protocol.ServerMessage{Type: "error", Error: "expected join message"})
-		return
+	var pName string
+	if b0[0] == protocol.MsgTypeJoin {
+		if _, err := br.ReadByte(); err != nil {
+			return
+		}
+		_, n, err := protocol.DecodeJoinAfterType(br)
+		if err != nil {
+			writeMsg(conn, protocol.ServerMessage{Type: "error", Error: "bad join message"})
+			return
+		}
+		pName = strings.TrimSpace(n)
+	} else {
+		line, err := br.ReadBytes('\n')
+		if err != nil {
+			return
+		}
+		var hello protocol.ClientMessage
+		if err := json.Unmarshal(line, &hello); err != nil || hello.Type != "join" {
+			writeMsg(conn, protocol.ServerMessage{Type: "error", Error: "expected join message"})
+			return
+		}
+		pName = strings.TrimSpace(hello.Name)
 	}
-
-	pName := strings.TrimSpace(hello.Name)
 	if pName == "" {
 		pName = "marine"
 	}
@@ -122,27 +165,29 @@ func (s *Server) handleConn(conn net.Conn) {
 		id:          playerID,
 		name:        pName,
 		conn:        conn,
-		send:        make(chan protocol.ServerMessage, 128),
+		send:        make(chan []byte, 8),
 		sendFullMap: true,
 	}
 
 	r.addPlayer(p)
 	defer r.removePlayer(playerID)
 
-	writeMsg(conn, protocol.ServerMessage{
-		Type:     "welcome",
-		PlayerID: playerID,
-		RoomID:   r.id,
-		Width:    r.width,
-		Height:   r.height,
+	wb := protocol.EncodeWelcome(protocol.WelcomePayload{
+		PlayerID:  playerID,
+		RoomID:    r.id,
+		Width:     r.width,
+		Height:    r.height,
 		LobbyText: "WASD to move, q to quit",
 	})
+	if _, err := conn.Write(wb); err != nil {
+		return
+	}
 
 	go p.writePump()
 	r.broadcastSnapshot()
 
 	for {
-		line, err := reader.ReadBytes('\n')
+		line, err := br.ReadBytes('\n')
 		if err != nil {
 			return
 		}
@@ -151,7 +196,7 @@ func (s *Server) handleConn(conn net.Conn) {
 			continue
 		}
 		if msg.Type == "input" {
-			r.applyInput(playerID, msg.Key)
+			r.applyInput(playerID, &msg)
 		}
 	}
 }
@@ -199,8 +244,8 @@ func newRoomFromWAD(roomID string, wadPath string, mapName string) (*Room, error
 		weapons:   weapons,
 		walls:     walls,
 		spawns:    spawns,
-		blocked:   blocked,
-		players:   map[string]*Player{},
+		blocked: blocked,
+		players: map[string]*Player{},
 	}, nil
 }
 
@@ -250,8 +295,8 @@ func newRoomFromJSON(roomID string, jsonPath string) (*Room, error) {
 		weapons:   weapons,
 		walls:     walls,
 		spawns:    spawns,
-		blocked:   layout.Blocked,
-		players:   map[string]*Player{},
+		blocked: layout.Blocked,
+		players: map[string]*Player{},
 	}, nil
 }
 
@@ -342,19 +387,18 @@ func roomSeed(roomID string) int64 {
 	return int64(h.Sum64())
 }
 
-func scatterSpawns(blocked map[string]struct{}, w, h, count, minDist int, seed int64, symmetry string) []protocol.GridPoint {
+func scatterSpawns(blocked map[uint64]struct{}, w, h, count, minDist int, seed int64, symmetry string) []protocol.GridPoint {
 	openMinX, openMaxX := 1, w-2
 	openMinY, openMaxY := 1, h-2
 	if openMaxX < openMinX || openMaxY < openMinY {
 		return nil
 	}
 
-	key := func(x, y int) string { return fmt.Sprintf("%d:%d", x, y) }
 	isOpen := func(x, y int) bool {
 		if x < openMinX || x > openMaxX || y < openMinY || y > openMaxY {
 			return false
 		}
-		_, ok := blocked[key(x, y)]
+		_, ok := blocked[nav.CellKey(x, y)]
 		return !ok
 	}
 
@@ -365,13 +409,13 @@ func scatterSpawns(blocked map[string]struct{}, w, h, count, minDist int, seed i
 
 	rnd := rand.New(rand.NewSource(seed))
 	selected := make([]protocol.GridPoint, 0, count)
-	selectedSet := map[string]struct{}{}
+	selectedSet := map[uint64]struct{}{}
 
 	tryAddPoint := func(x, y int) bool {
 		if !isOpen(x, y) {
 			return false
 		}
-		k := key(x, y)
+		k := nav.CellKey(x, y)
 		if _, ok := selectedSet[k]; ok {
 			return false
 		}
@@ -406,13 +450,13 @@ func scatterSpawns(blocked map[string]struct{}, w, h, count, minDist int, seed i
 		}
 
 		// Add unique points; reject the whole group if any point is blocked.
-		unique := make(map[string][2]int, len(points))
+		unique := make(map[uint64][2]int, len(points))
 		for _, p := range points {
 			x, y := p[0], p[1]
 			if !isOpen(x, y) {
 				return 0
 			}
-			unique[key(x, y)] = [2]int{x, y}
+			unique[nav.CellKey(x, y)] = [2]int{x, y}
 		}
 		added := 0
 		for _, p := range unique {
@@ -486,8 +530,8 @@ func scatterSpawns(blocked map[string]struct{}, w, h, count, minDist int, seed i
 	return selected
 }
 
-func mapWalls(md *wad.MapData, minX, minY, maxX, maxY, w, h int) ([]protocol.GridPoint, map[string]struct{}) {
-	blocked := map[string]struct{}{}
+func mapWalls(md *wad.MapData, minX, minY, maxX, maxY, w, h int) ([]protocol.GridPoint, map[uint64]struct{}) {
+	blocked := map[uint64]struct{}{}
 	for _, ln := range md.LineDefs {
 		if int(ln.StartVertex) >= len(md.Vertices) || int(ln.EndVertex) >= len(md.Vertices) {
 			continue
@@ -499,13 +543,12 @@ func mapWalls(md *wad.MapData, minX, minY, maxX, maxY, w, h int) ([]protocol.Gri
 		x2 := project(int(v2.X), minX, maxX, 1, w-2)
 		y2 := project(int(v2.Y), minY, maxY, 1, h-2)
 		for _, p := range rasterLine(x1, y1, x2, y2) {
-			blocked[key(p.X, p.Y)] = struct{}{}
+			blocked[nav.CellKey(p.X, p.Y)] = struct{}{}
 		}
 	}
 	walls := make([]protocol.GridPoint, 0, len(blocked))
 	for k := range blocked {
-		var x, y int
-		_, _ = fmt.Sscanf(k, "%d:%d", &x, &y)
+		x, y := nav.CellUnpack(k)
 		walls = append(walls, protocol.GridPoint{X: x, Y: y})
 	}
 	return walls, blocked
@@ -549,8 +592,18 @@ func abs(v int) int {
 	return v
 }
 
-func key(x, y int) string {
-	return fmt.Sprintf("%d:%d", x, y)
+func absInt(n int) int {
+	if n < 0 {
+		return -n
+	}
+	return n
+}
+
+// angleTowardMapCenter — направление «вперёд» к центру карты (для дуэльных спавнов смотрят друг на друга).
+func angleTowardMapCenter(px, py float64, w, h int) float64 {
+	cx := float64(w) / 2.0
+	cy := float64(h) / 2.0
+	return math.Atan2(cy-py, cx-px)
 }
 
 func project(val, srcMin, srcMax, dstMin, dstMax int) int {
@@ -571,12 +624,115 @@ func project(val, srcMin, srcMax, dstMin, dstMax int) int {
 func (r *Room) addPlayer(p *Player) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	spawn := r.spawns[rand.Intn(len(r.spawns))]
-	spawnX, spawnY := spawn.X, spawn.Y
+	spawnX, spawnY := r.pickSpawnNearPlayersExcludingLocked("")
 	p.x = spawnX
 	p.y = spawnY
-	p.angle = -math.Pi / 2
+	p.angle = angleTowardMapCenter(spawnX, spawnY, r.width, r.height)
+	p.hp = 100
+	p.armor = 0
+	p.dead = false
+	p.lastFireNano = 0
+	p.lastHitConfirmNano = 0
+	p.killedBy = ""
+	p.ticksSinceMove = 1000
+	p.walkPhase = 0
+	resetPlayerAmmo(p)
+	p.money = render.StartingMoney
 	r.players[p.id] = p
+}
+
+func resetPlayerAmmo(p *Player) {
+	p.pistolMag = render.HUDPistolMagMax
+	p.rifleMag = render.HUDRifleMagMax
+	p.rifleReserve = render.HUDRifleReserveSpawn
+}
+
+func cellCenter(cx, cy int) (float64, float64) {
+	return float64(cx) + 0.5, float64(cy) + 0.5
+}
+
+// pickSpawnNearPlayersExcludingLocked — рядом с другими игроками; exceptID не учитывается как «занятая» клетка (респавн).
+func (r *Room) pickSpawnNearPlayersExcludingLocked(exceptID string) (float64, float64) {
+	if len(r.spawns) == 0 {
+		return cellCenter(r.width/2, r.height/2)
+	}
+	hasOther := false
+	for id := range r.players {
+		if id != exceptID {
+			hasOther = true
+			break
+		}
+	}
+	if !hasOther {
+		s := r.spawns[rand.Intn(len(r.spawns))]
+		return cellCenter(s.X, s.Y)
+	}
+	// Несколько точек из карты (Start/End): выбираем свободную, максимально далёкую от уже стоящих игроков
+	// (дуэль / test_arena_3x3 — второй игрок напротив первого).
+	if len(r.spawns) >= 2 {
+		bestX, bestY := -1, -1
+		bestScore := -1
+		for _, s := range r.spawns {
+			if r.isCellOccupiedLockedExcept(s.X, s.Y, exceptID) {
+				continue
+			}
+			minDist := int(^uint(0) >> 1)
+			for id, pl := range r.players {
+				if id == exceptID {
+					continue
+				}
+				d := absInt(int(math.Floor(pl.x))-s.X) + absInt(int(math.Floor(pl.y))-s.Y)
+				if d < minDist {
+					minDist = d
+				}
+			}
+			if minDist > bestScore {
+				bestScore = minDist
+				bestX, bestY = s.X, s.Y
+			}
+		}
+		if bestX >= 0 {
+			return cellCenter(bestX, bestY)
+		}
+	}
+	offs := []struct{ dx, dy int }{
+		{1, 0}, {-1, 0}, {0, 1}, {0, -1},
+		{1, 1}, {1, -1}, {-1, 1}, {-1, -1},
+		{2, 0}, {-2, 0}, {0, 2}, {0, -2},
+	}
+	for id, pl := range r.players {
+		if id == exceptID {
+			continue
+		}
+		for _, o := range offs {
+			cx := int(math.Floor(pl.x)) + o.dx
+			cy := int(math.Floor(pl.y)) + o.dy
+			if cx < 1 || cx > r.width-2 || cy < 1 || cy > r.height-2 {
+				continue
+			}
+			if _, ok := r.blocked[nav.CellKey(cx, cy)]; ok {
+				continue
+			}
+			if r.isCellOccupiedLockedExcept(cx, cy, exceptID) {
+				continue
+			}
+			return cellCenter(cx, cy)
+		}
+	}
+	s := r.spawns[rand.Intn(len(r.spawns))]
+	return cellCenter(s.X, s.Y)
+}
+
+func (r *Room) isCellOccupiedLockedExcept(x, y int, exceptID string) bool {
+	for id, pl := range r.players {
+		if id == exceptID {
+			continue
+		}
+		if int(math.Floor(pl.x)) == x && int(math.Floor(pl.y)) == y {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *Room) removePlayer(playerID string) {
@@ -590,14 +746,42 @@ func (r *Room) removePlayer(playerID string) {
 	r.broadcastSnapshot()
 }
 
-func (r *Room) applyInput(playerID string, key string) {
+func (r *Room) applyInput(playerID string, msg *protocol.ClientMessage) {
 	r.mu.Lock()
 	p := r.players[playerID]
 	if p == nil {
 		r.mu.Unlock()
 		return
 	}
-	switch strings.ToLower(key) {
+	key := strings.ToLower(strings.TrimSpace(msg.Key))
+
+	// Пинг обрабатываем и мёртвым (таблица / измерение RTT на экране смерти не рисуется, но соединение живо).
+	if key == "ping" && msg.PingNano != 0 {
+		p.echoPingNano = msg.PingNano
+		if msg.PingRTTMs > 0 && msg.PingRTTMs <= 2000 {
+			p.reportedPingMs = msg.PingRTTMs
+		}
+		r.mu.Unlock()
+		return
+	}
+
+	if p.dead {
+		if key == "r" {
+			r.respawnPlayerLocked(p)
+		}
+		r.mu.Unlock()
+		return
+	}
+
+	switch key {
+	case "r":
+		if msg.Weapon == render.HUDWeaponRifle {
+			r.tryReloadRifleLocked(p)
+		} else {
+			r.tryReloadPistolLocked(p)
+		}
+	case "fire":
+		r.tryFireLocked(p, msg.Weapon)
 	case "w":
 		stepMove(r, p, 1.0)
 	case "s":
@@ -606,6 +790,8 @@ func (r *Room) applyInput(playerID string, key string) {
 		p.angle -= 0.20
 	case "d":
 		p.angle += 0.20
+	case "buy":
+		r.tryPurchaseLocked(p, msg.Buy)
 	}
 	if p.angle < -math.Pi {
 		p.angle += 2 * math.Pi
@@ -614,39 +800,331 @@ func (r *Room) applyInput(playerID string, key string) {
 		p.angle -= 2 * math.Pi
 	}
 	r.mu.Unlock()
-	r.broadcastSnapshot()
+	// State рассылает broadcastTicker; не вызывать broadcastSnapshot здесь.
 }
 
+func (r *Room) respawnPlayerLocked(p *Player) {
+	if len(r.spawns) == 0 {
+		return
+	}
+	p.x, p.y = r.pickSpawnNearPlayersExcludingLocked(p.id)
+	p.angle = angleTowardMapCenter(p.x, p.y, r.width, r.height)
+	p.hp = 100
+	p.armor = 0
+	p.dead = false
+	p.killedBy = ""
+	p.ticksSinceMove = 1000
+	p.walkPhase = 0
+	// Патроны автомата не сбрасываем: после смерти столько же, сколько было в момент смерти.
+}
+
+const fireCooldownNanos = int64(380e6)
+
+// ~200 ms при ROOM_TICK_MS=4; при другом тике длительность «ходьбы» для анимации масштабируется.
+const moveAnimTicks = 50
+
+func (r *Room) tryReloadRifleLocked(p *Player) {
+	if p.dead {
+		return
+	}
+	if p.rifleMag >= render.HUDRifleMagMax {
+		return
+	}
+	if p.rifleReserve <= 0 {
+		return
+	}
+	need := render.HUDRifleMagMax - p.rifleMag
+	if need > p.rifleReserve {
+		need = p.rifleReserve
+	}
+	p.rifleMag += need
+	p.rifleReserve -= need
+}
+
+func (r *Room) tryReloadPistolLocked(p *Player) {
+	if p.dead {
+		return
+	}
+	if p.pistolMag >= render.HUDPistolMagMax {
+		return
+	}
+	p.pistolMag = render.HUDPistolMagMax
+}
+
+func (r *Room) tryFireLocked(shooter *Player, weapon int) {
+	if shooter.dead {
+		return
+	}
+	now := time.Now().UnixNano()
+	if now-shooter.lastFireNano < fireCooldownNanos {
+		return
+	}
+	isRifle := weapon == render.HUDWeaponRifle
+	if isRifle {
+		if shooter.rifleMag <= 0 {
+			return
+		}
+	} else {
+		if shooter.pistolMag <= 0 {
+			return
+		}
+	}
+
+	shooter.lastFireNano = now
+	if isRifle {
+		shooter.rifleMag--
+	} else {
+		shooter.pistolMag--
+	}
+
+	target := r.traceHitPlayer(shooter)
+	if target == nil {
+		return
+	}
+	shooter.lastHitConfirmNano = now
+	dmg := render.HUDPistolDamage
+	if isRifle {
+		dmg = render.HUDRifleDamage
+	}
+	wasAlive := !target.dead
+	r.applyDamageLocked(target, dmg)
+	if wasAlive && target.dead {
+		target.killedBy = shooter.name
+		r.pushKillFeedLocked(shooter.name, target.name)
+		shooter.money += render.KillRewardMoney
+		shooter.kills++
+		target.deaths++
+	}
+}
+
+const maxKillFeedEntries = 8
+
+func (r *Room) pushKillFeedLocked(killerName, victimName string) {
+	r.killFeed = append(r.killFeed, protocol.KillFeedEntry{Killer: killerName, Victim: victimName})
+	if len(r.killFeed) > maxKillFeedEntries {
+		r.killFeed = r.killFeed[len(r.killFeed)-maxKillFeedEntries:]
+	}
+}
+
+func (r *Room) tryPurchaseLocked(p *Player, item string) {
+	if p.dead {
+		return
+	}
+	item = strings.ToLower(strings.TrimSpace(item))
+	switch item {
+	case "ammo", "rifle_ammo", "rifle":
+		if p.money < render.ShopAmmoPrice {
+			return
+		}
+		if p.rifleReserve >= render.ShopMaxRifleReserve {
+			return
+		}
+		p.money -= render.ShopAmmoPrice
+		p.rifleReserve += render.ShopAmmoRounds
+		if p.rifleReserve > render.ShopMaxRifleReserve {
+			p.rifleReserve = render.ShopMaxRifleReserve
+		}
+	case "armor", "vest":
+		if p.money < render.ShopArmorPrice {
+			return
+		}
+		if p.armor >= render.ShopMaxArmor {
+			return
+		}
+		p.money -= render.ShopArmorPrice
+		p.armor += render.ShopArmorAdd
+		if p.armor > render.ShopMaxArmor {
+			p.armor = render.ShopMaxArmor
+		}
+	}
+}
+
+func (r *Room) applyDamageLocked(target *Player, dmg int) {
+	if target.armor > render.ShopMaxArmor {
+		target.armor = render.ShopMaxArmor
+	}
+	if !target.dead && dmg > 0 {
+		rest := dmg
+		if target.armor > 0 {
+			abs := rest
+			if rest > target.armor {
+				abs = target.armor
+			}
+			target.armor -= abs
+			rest -= abs
+		}
+		target.hp -= rest
+		if target.hp <= 0 {
+			target.hp = 0
+			target.dead = true
+		}
+	}
+}
+
+// traceHitPlayer — hitscan по лучу из центра клетки стрелка. Клетка цели — AABB [px,px+1]×[py,py+1];
+// пошаговый floor(x/y) пропускает клетки по диагонали, поэтому используем пересечение луча с клеткой + LOS по стенам.
+func (r *Room) traceHitPlayer(shooter *Player) *Player {
+	const maxDist = 40.0
+	ox := shooter.x
+	oy := shooter.y
+	dx := math.Cos(shooter.angle)
+	dy := math.Sin(shooter.angle)
+
+	type cand struct {
+		pl *Player
+		t  float64
+	}
+	var hits []cand
+	for id, pl := range r.players {
+		if id == shooter.id || pl.dead {
+			continue
+		}
+		px := int(math.Floor(pl.x))
+		py := int(math.Floor(pl.y))
+		t, ok := rayHitGridCell2D(ox, oy, dx, dy, px, py, maxDist)
+		if !ok {
+			continue
+		}
+		if r.rayBlockedByWalls(ox, oy, dx, dy, t) {
+			continue
+		}
+		hits = append(hits, cand{pl: pl, t: t})
+	}
+	if len(hits) == 0 {
+		return nil
+	}
+	best := hits[0]
+	for i := 1; i < len(hits); i++ {
+		if hits[i].t < best.t {
+			best = hits[i]
+		}
+	}
+	return best.pl
+}
+
+// rayHitGridCell2D — расстояние до входа луча O+t*D в клетку [px,px+1]×[py,py+1], t∈[0,maxDist].
+func rayHitGridCell2D(ox, oy, dx, dy float64, px, py int, maxDist float64) (float64, bool) {
+	minx := float64(px)
+	maxx := float64(px + 1)
+	miny := float64(py)
+	maxy := float64(py + 1)
+
+	const eps = 1e-9
+	var tx0, tx1 float64
+	if math.Abs(dx) < eps {
+		if ox <= minx || ox >= maxx {
+			return 0, false
+		}
+		tx0 = -math.MaxFloat64
+		tx1 = math.MaxFloat64
+	} else {
+		inv := 1.0 / dx
+		t1 := (minx - ox) * inv
+		t2 := (maxx - ox) * inv
+		tx0 = math.Min(t1, t2)
+		tx1 = math.Max(t1, t2)
+	}
+	var ty0, ty1 float64
+	if math.Abs(dy) < eps {
+		if oy <= miny || oy >= maxy {
+			return 0, false
+		}
+		ty0 = -math.MaxFloat64
+		ty1 = math.MaxFloat64
+	} else {
+		inv := 1.0 / dy
+		t1 := (miny - oy) * inv
+		t2 := (maxy - oy) * inv
+		ty0 = math.Min(t1, t2)
+		ty1 = math.Max(t1, t2)
+	}
+	tEnter := math.Max(tx0, ty0)
+	tExit := math.Min(tx1, ty1)
+	if tExit < tEnter {
+		return 0, false
+	}
+	var tHit float64
+	switch {
+	case tEnter >= 0:
+		tHit = tEnter
+	case tExit >= 0:
+		// луч начинает внутри клетки (редко)
+		tHit = 0
+	default:
+		return 0, false
+	}
+	if tHit > maxDist {
+		return 0, false
+	}
+	return tHit, true
+}
+
+// rayBlockedByWalls — есть ли стена на отрезке (0, limitT) вдоль луча (мелкий шаг, без пропуска клеток по диагонали).
+func (r *Room) rayBlockedByWalls(ox, oy, dx, dy, limitT float64) bool {
+	const step = 0.06
+	if limitT <= step {
+		return false
+	}
+	for t := step; t < limitT; t += step {
+		x := ox + dx*t
+		y := oy + dy*t
+		gx := int(math.Floor(x))
+		gy := int(math.Floor(y))
+		if gx < 0 || gy < 0 || gx >= r.width || gy >= r.height {
+			return true
+		}
+		if _, ok := r.blocked[nav.CellKey(gx, gy)]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+const moveStepPerTick = 0.26
+
 func stepMove(r *Room, p *Player, dir float64) {
-	nx := int(math.Round(float64(p.x) + math.Cos(p.angle)*dir))
-	ny := int(math.Round(float64(p.y) + math.Sin(p.angle)*dir))
+	nx := p.x + math.Cos(p.angle)*dir*moveStepPerTick
+	ny := p.y + math.Sin(p.angle)*dir*moveStepPerTick
 	tryMove(r, p, nx, ny)
 }
 
-func tryMove(r *Room, p *Player, nx, ny int) {
-	if nx < 1 || nx > r.width-2 || ny < 1 || ny > r.height-2 {
+func tryMove(r *Room, p *Player, nx, ny float64) {
+	fx, fy, ok := nav.TryMoveSlide(r.blocked, r.width, r.height, p.x, p.y, nx, ny)
+	if !ok {
 		return
 	}
-	if _, ok := r.blocked[key(nx, ny)]; ok {
-		return
+	p.x = fx
+	p.y = fy
+	p.ticksSinceMove = 0
+	p.walkPhase = (p.walkPhase + 1) % 8
+}
+
+// FindNavPath — A* по NavMesh (полигоны из той же сетки, что blocked). Меш строится один раз при первом вызове;
+// при загрузке комнаты навмеш не считается — движение только через nav.TryMoveSlide(blocked).
+func (r *Room) FindNavPath(ax, ay, bx, by float64) ([]navmesh.Vec2, bool) {
+	r.navMeshOnce.Do(func() {
+		r.navMesh = navmesh.BuildFromBlocked(r.width, r.height, r.blocked)
+	})
+	m := r.navMesh
+	if m == nil || len(m.Polys) == 0 {
+		return nil, false
 	}
-	p.x = nx
-	p.y = ny
+	return m.FindPath(ax, ay, bx, by)
 }
 
 func roomTickInterval() time.Duration {
 	v := strings.TrimSpace(os.Getenv("ROOM_TICK_MS"))
 	if v == "" {
-		return 16 * time.Millisecond
+		return 4 * time.Millisecond
 	}
 	ms, err := strconv.Atoi(v)
-	if err != nil || ms < 8 || ms > 100 {
-		return 16 * time.Millisecond
+	if err != nil || ms < 4 || ms > 100 {
+		return 4 * time.Millisecond
 	}
 	return time.Duration(ms) * time.Millisecond
 }
 
-// broadcastTicker шлёт state с заданным интервалом (по умолчанию ~62 Гц).
+// broadcastTicker шлёт state с заданным интервалом (по умолчанию 4 ms ≈250 Гц; ROOM_TICK_MS).
 func (r *Room) broadcastTicker() {
 	ticker := time.NewTicker(roomTickInterval())
 	defer ticker.Stop()
@@ -673,16 +1151,57 @@ func (r *Room) broadcastSnapshot() {
 		return
 	}
 
-	pstates := make([]protocol.PlayerState, 0, len(players)+1)
+	nowNano := time.Now().UnixNano()
+	pstates := make([]protocol.PlayerState, 0, len(players))
 	for _, p := range players {
+		fireAge := 0
+		if p.lastFireNano > 0 {
+			d := (nowNano - p.lastFireNano) / 1e6
+			if d >= 0 && d <= 1000 {
+				fireAge = int(d)
+				// 0 мс «только что выстрелил» съедалось json omitempty — клиент не видел вспышку.
+				if fireAge == 0 {
+					fireAge = 1
+				}
+			}
+		}
+		hitAge := 0
+		if p.lastHitConfirmNano > 0 {
+			d := (nowNano - p.lastHitConfirmNano) / 1e6
+			if d >= 0 && d <= 600 {
+				hitAge = int(d)
+				if hitAge == 0 {
+					hitAge = 1
+				}
+			}
+		}
+		kb := ""
+		if p.dead {
+			kb = p.killedBy
+		}
+		echoPing := int64(0)
+		if p.echoPingNano != 0 {
+			echoPing = p.echoPingNano
+			p.echoPingNano = 0
+		}
 		pstates = append(pstates, protocol.PlayerState{
 			ID: p.id, Name: p.name, X: p.x, Y: p.y, Angle: p.angle,
+			HP: p.hp, Armor: p.armor, Dead: p.dead,
+			Moving:          p.ticksSinceMove < moveAnimTicks,
+			WalkPhase:       p.walkPhase,
+			FireAgeMs:       fireAge,
+			HitConfirmAgeMs: hitAge,
+			KilledBy:        kb,
+			PistolMag:       p.pistolMag,
+			RifleMag:        p.rifleMag,
+			RifleReserve:    p.rifleReserve,
+			Money:           p.money,
+			Kills:           p.kills,
+			Deaths:          p.deaths,
+			EchoPingNano:    echoPing,
+			PingMs:          p.reportedPingMs,
 		})
 	}
-	if len(players) == 1 {
-		pstates = append(pstates, r.demoMarineNear(players[0]))
-	}
-
 	needFull := false
 	for _, p := range players {
 		if p.sendFullMap {
@@ -697,105 +1216,91 @@ func (r *Room) broadcastSnapshot() {
 		weaponsCopy = append([]protocol.WeaponSpawn(nil), r.weapons...)
 	}
 
+	killCopy := make([]protocol.KillFeedEntry, len(r.killFeed))
+	copy(killCopy, r.killFeed)
+	compactSnap := protocol.RoomSnapshot{
+		RoomID:      r.id,
+		Width:       r.width,
+		Height:      r.height,
+		MapTitle:    r.mapTitle,
+		WallTexture: r.wallTex,
+		CeilingFlat: r.ceilFlat,
+		FloorFlat:   r.floorFlat,
+		Players:     pstates,
+		KillFeed:    killCopy,
+	}
+	lineCompact, err := protocol.MarshalServerLine(&protocol.ServerMessage{Type: "state", State: &compactSnap})
+	if err != nil {
+		return
+	}
+	lineCompact = protocol.MaybeGzipServerLine(lineCompact)
+	var lineFull []byte
+	if needFull {
+		fullSnap := compactSnap
+		fullSnap.Walls = wallsCopy
+		fullSnap.Weapons = weaponsCopy
+		lineFull, err = protocol.MarshalServerLine(&protocol.ServerMessage{Type: "state", State: &fullSnap})
+		if err != nil {
+			return
+		}
+		lineFull = protocol.MaybeGzipServerLine(lineFull)
+	}
+
 	for _, p := range players {
-		out := protocol.RoomSnapshot{
-			RoomID:      r.id,
-			Width:       r.width,
-			Height:      r.height,
-			MapTitle:    r.mapTitle,
-			WallTexture: r.wallTex,
-			CeilingFlat: r.ceilFlat,
-			FloorFlat:   r.floorFlat,
-			Players:     pstates,
-		}
-		if p.sendFullMap {
-			out.Walls = wallsCopy
-			out.Weapons = weaponsCopy
+		if p.sendFullMap && len(lineFull) > 0 {
 			p.sendFullMap = false
+			coalesceSendLine(p.send, append([]byte(nil), lineFull...))
+		} else {
+			coalesceSendLine(p.send, append([]byte(nil), lineCompact...))
 		}
-		msg := protocol.ServerMessage{Type: "state", State: &out}
-		select {
-		case p.send <- msg:
-		default:
-		}
+	}
+	for _, p := range players {
+		p.ticksSinceMove++
 	}
 }
 
 func (p *Player) writePump() {
 	ticker := time.NewTicker(20 * time.Second)
 	defer ticker.Stop()
+	w := bufio.NewWriterSize(p.conn, 32*1024)
 	for {
 		select {
-		case msg, ok := <-p.send:
+		case line, ok := <-p.send:
 			if !ok {
+				_ = w.Flush()
 				return
 			}
-			if err := writeMsg(p.conn, msg); err != nil {
+			if _, err := w.Write(line); err != nil {
 				return
+			}
+		drain:
+			for {
+				select {
+				case more, ok := <-p.send:
+					if !ok {
+						_ = w.Flush()
+						return
+					}
+					if _, err := w.Write(more); err != nil {
+						return
+					}
+				default:
+					if err := w.Flush(); err != nil {
+						return
+					}
+					break drain
+				}
 			}
 		case <-ticker.C:
-			_ = writeMsg(p.conn, protocol.ServerMessage{Type: "ping"})
+			pl := pingLineBytes()
+			if _, err := w.Write(pl); err != nil {
+				return
+			}
+			if err := w.Flush(); err != nil {
+				return
+			}
 		}
 	}
-}
-
-// demoMarineNear — несколько клеток перед игроком, лицом к нему (проверка PLAYA*).
-func (r *Room) demoMarineNear(p *Player) protocol.PlayerState {
-	for _, step := range []int{4, 3, 5, 2, 6, 1} {
-		nx := int(math.Round(float64(p.x) + float64(step)*math.Cos(p.angle)))
-		ny := int(math.Round(float64(p.y) + float64(step)*math.Sin(p.angle)))
-		if nx < 1 || nx > r.width-2 || ny < 1 || ny > r.height-2 {
-			continue
-		}
-		if nx == p.x && ny == p.y {
-			continue
-		}
-		if _, ok := r.blocked[key(nx, ny)]; ok {
-			continue
-		}
-		ang := math.Atan2(float64(p.y-ny), float64(p.x-nx))
-		return protocol.PlayerState{
-			ID:    demoPlayerID,
-			Name:  "MARINE",
-			X:     nx,
-			Y:     ny,
-			Angle: ang,
-		}
-	}
-	x, y, ang := r.pickDemoMarineCell()
-	return protocol.PlayerState{
-		ID:    demoPlayerID,
-		Name:  "MARINE",
-		X:     x,
-		Y:     y,
-		Angle: ang,
-	}
-}
-
-func (r *Room) pickDemoMarineCell() (int, int, float64) {
-	if len(r.spawns) == 0 {
-		cx := r.width / 2
-		cy := r.height / 2
-		return cx, cy, -math.Pi / 2
-	}
-	sx, sy := r.spawns[0].X, r.spawns[0].Y
-	tries := []struct{ dx, dy int }{
-		{0, -3}, {0, -4}, {0, -2}, {0, -1},
-		{1, -2}, {-1, -2}, {2, -2}, {-2, -2},
-		{2, 0}, {-2, 0}, {0, 2},
-	}
-	for _, t := range tries {
-		nx, ny := sx+t.dx, sy+t.dy
-		if nx < 1 || nx > r.width-2 || ny < 1 || ny > r.height-2 {
-			continue
-		}
-		if _, ok := r.blocked[key(nx, ny)]; ok {
-			continue
-		}
-		ang := math.Atan2(float64(sy-ny), float64(sx-nx))
-		return nx, ny, ang
-	}
-	return sx, sy, -math.Pi / 2
 }
 
 func setTCPNoDelay(c net.Conn) {
@@ -804,12 +1309,43 @@ func setTCPNoDelay(c net.Conn) {
 	}
 }
 
+var (
+	pingLineBuf []byte
+	pingOnce    sync.Once
+)
+
+func pingLineBytes() []byte {
+	pingOnce.Do(func() {
+		var err error
+		pingLineBuf, err = protocol.MarshalServerLine(&protocol.ServerMessage{Type: "ping"})
+		if err != nil {
+			pingLineBuf = []byte("{\"type\":\"ping\"}\n")
+		}
+	})
+	return pingLineBuf
+}
+
+// coalesceSendLine кладёт строку в канал; при переполнении сбрасывает старый кадр — остаётся последний state.
+func coalesceSendLine(ch chan []byte, line []byte) {
+	select {
+	case ch <- line:
+	default:
+		select {
+		case <-ch:
+		default:
+		}
+		select {
+		case ch <- line:
+		default:
+		}
+	}
+}
+
 func writeMsg(conn net.Conn, m protocol.ServerMessage) error {
-	b, err := json.Marshal(m)
+	b, err := protocol.MarshalServerLine(&m)
 	if err != nil {
 		return err
 	}
-	b = append(b, '\n')
 	_, err = conn.Write(b)
 	return err
 }

@@ -10,8 +10,8 @@ func rgbLum(c uint32) int {
 	return (r*299 + g*587 + b*114) / 1000
 }
 
-func marineGlyphForTag(tag rune) (rune, uint32) {
-	// Буквенные теги (если есть); иначе — пользовательский ASCII-арт (= * # % …).
+func marineGlyphForTag(tag rune, y, h, x, maxW int) (rune, uint32) {
+	// Буквенные теги (если есть); иначе — пользовательский ASCII-арт с тинтом по зонам тела.
 	switch tag {
 	case ' ', '\t':
 		return 0, 0
@@ -64,7 +64,7 @@ func marineGlyphForTag(tag rune) (rune, uint32) {
 		c := RGBPacked(58, 60, 68)
 		return lumaChar(clamp(rgbLum(c)-24, 0, 255)), c
 	default:
-		return marineGlyphFromAscii(tag)
+		return marineTintByPos(tag, y, h, x, maxW)
 	}
 }
 
@@ -102,7 +102,7 @@ func parseMarineLayout(lines []string) PistolHUDFrame {
 			if x < len(rows[y]) {
 				ch = rows[y][x]
 			}
-			r, c := marineGlyphForTag(ch)
+			r, c := marineGlyphForTag(ch, y, h, x, maxW)
 			fr.Chars[y][x] = r
 			fr.RGB[y][x] = c
 		}

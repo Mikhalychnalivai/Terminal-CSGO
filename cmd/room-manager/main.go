@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -17,13 +18,14 @@ import (
 type manager struct {
 	roomImage string
 	network   string
-	wadMap    string
 }
 
 type roomRequest struct {
 	RoomID string `json:"room_id"`
-	// MapID: "1" / "map1" — map1.json, "2" / "map2" — map2.json, "wad" — карта из DOOM.WAD (WAD_MAP).
+	// MapID: по умолчанию corridor5 (коридор, 5 комнат); см. ensureRoom.
 	MapID string `json:"map_id"`
+	// MapJSON: сырое тело JSON-карты (редактор SSH); только при map_id=custom|editor.
+	MapJSON string `json:"map_json"`
 }
 
 type roomResponse struct {
@@ -35,7 +37,6 @@ func main() {
 	m := &manager{
 		roomImage: getenv("ROOM_IMAGE", "doom-ssh-arena:latest"),
 		network:   getenv("DOCKER_NETWORK", "hack2026mart_default"),
-		wadMap:    getenv("WAD_MAP", "E1M2"),
 	}
 
 	mux := http.NewServeMux()
@@ -63,7 +64,7 @@ func (m *manager) handleCreate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	addr, err := m.ensureRoom(req.RoomID, req.MapID)
+	addr, err := m.ensureRoom(req)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -89,7 +90,8 @@ func (m *manager) handleGet(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, roomResponse{RoomID: req.RoomID, Addr: addr})
 }
 
-func (m *manager) ensureRoom(roomID string, mapID string) (string, error) {
+func (m *manager) ensureRoom(req roomRequest) (string, error) {
+	roomID := req.RoomID
 	name := roomContainerName(roomID)
 	exists, _, err := inspectContainer(name)
 	if err != nil {
@@ -102,14 +104,19 @@ func (m *manager) ensureRoom(roomID string, mapID string) (string, error) {
 		}
 	}
 
-	tickMS := getenv("ROOM_TICK_MS", "16")
+	tickMS := getenv("ROOM_TICK_MS", "4")
 	spawnCount := getenv("SPAWN_COUNT", "10")
 	spawnMinDist := getenv("SPAWN_MIN_DIST", "7")
 	spawnSymmetry := getenv("SPAWN_SYMMETRY", "4")
 
-	mapID = strings.ToLower(strings.TrimSpace(mapID))
+	mapID := strings.ToLower(strings.TrimSpace(req.MapID))
+	mapJSON := strings.TrimSpace(req.MapJSON)
 	if mapID == "" {
-		mapID = getenv("DEFAULT_MAP_ID", "1")
+		if mapJSON != "" {
+			mapID = "custom"
+		} else {
+			mapID = getenv("DEFAULT_MAP_ID", "corridor5")
+		}
 	}
 
 	args := []string{
@@ -120,38 +127,60 @@ func (m *manager) ensureRoom(roomID string, mapID string) (string, error) {
 		"-e", "ROOM_ADDR=:7000",
 		"-e", "ROOM_ID=" + roomID,
 		"-e", "ROOM_TICK_MS=" + tickMS,
+	}
+	if v := strings.TrimSpace(os.Getenv("ROOM_STATE_GZIP")); v != "" {
+		args = append(args, "-e", "ROOM_STATE_GZIP="+v)
+	}
+	if v := strings.TrimSpace(os.Getenv("ROOM_GZIP_MIN_BYTES")); v != "" {
+		args = append(args, "-e", "ROOM_GZIP_MIN_BYTES="+v)
+	}
+	args = append(args,
 		"-e", "SPAWN_COUNT=" + spawnCount,
 		"-e", "SPAWN_MIN_DIST=" + spawnMinDist,
 		"-e", "SPAWN_SYMMETRY=" + spawnSymmetry,
-	}
+	)
 
 	switch mapID {
-	case "wad", "doom":
-		// классическая карта из WAD
-		spawnMode := getenv("SPAWN_MODE", "scatter")
+	case "custom", "editor":
+		if mapJSON == "" {
+			return "", fmt.Errorf("map_json required for custom map")
+		}
+		if len(mapJSON) > 2*1024*1024 {
+			return "", fmt.Errorf("map_json too large (max 2 MiB)")
+		}
+		if !json.Valid([]byte(mapJSON)) {
+			return "", fmt.Errorf("invalid map_json")
+		}
+		mapDir := getenv("ROOM_MAPS_DIR", "/data/maps")
+		if err := os.MkdirAll(mapDir, 0755); err != nil {
+			return "", fmt.Errorf("maps dir: %w", err)
+		}
+		fname := name + ".json"
+		hostPath := filepath.Join(mapDir, fname)
+		if err := os.WriteFile(hostPath, []byte(mapJSON), 0644); err != nil {
+			return "", fmt.Errorf("write map: %w", err)
+		}
+		vol := getenv("ROOM_MAPS_DOCKER_VOLUME", "")
+		if vol == "" {
+			return "", fmt.Errorf("custom map needs ROOM_MAPS_DOCKER_VOLUME (docker volume name; see docker-compose)")
+		}
 		args = append(args,
-			"-e", "WAD_PATH=/assets/DOOM.WAD",
-			"-e", "WAD_MAP="+m.wadMap,
-			"-e", "SPAWN_MODE="+spawnMode,
-		)
-	case "1", "map1":
-		args = append(args,
-			"-e", "JSON_MAP_PATH=/assets/maps/map1.json",
-			// Для JSON не используем общий SPAWN_MODE=scatter из compose (он для WAD): спавны из Start/End,
-			// разброс только если JSON_USE_SCATTER=1 (см. appendJSONScatterEnv).
+			"-v", vol+":/data/maps:ro",
+			"-e", "JSON_MAP_PATH=/data/maps/"+fname,
+			"-e", "JSON_MAP_SCALE=1",
 			"-e", "SPAWN_MODE=from_map",
 		)
 		args = appendJSONMapEnv(args)
 		args = appendJSONScatterEnv(args)
-	case "2", "map2":
+	case "1", "corridor5", "corridor", "default", "map":
 		args = append(args,
-			"-e", "JSON_MAP_PATH=/assets/maps/map2.json",
+			"-e", "JSON_MAP_PATH=/assets/maps/corridor5.json",
 			"-e", "SPAWN_MODE=from_map",
 		)
 		args = appendJSONMapEnv(args)
 		args = appendJSONScatterEnv(args)
 	default:
-		return "", fmt.Errorf("unknown map_id: use 1, 2, map1, map2 or wad")
+		return "", fmt.Errorf("unknown map_id: use 1, corridor5, custom (with map_json), …")
 	}
 
 	args = append(args, m.roomImage, "/usr/local/bin/room")
@@ -223,6 +252,7 @@ func decodeReq(r *http.Request) (roomRequest, error) {
 		req.RoomID = "arena"
 	}
 	req.MapID = strings.TrimSpace(req.MapID)
+	req.MapJSON = strings.TrimSpace(req.MapJSON)
 	return req, nil
 }
 
@@ -246,6 +276,9 @@ func appendJSONMapEnv(args []string) []string {
 	}
 	if v := strings.TrimSpace(os.Getenv("JSON_MAP_SCALE")); v != "" {
 		args = append(args, "-e", "JSON_MAP_SCALE="+v)
+	}
+	if v := strings.TrimSpace(os.Getenv("JSON_SIMPLE_GRID")); v != "" {
+		args = append(args, "-e", "JSON_SIMPLE_GRID="+v)
 	}
 	return args
 }
