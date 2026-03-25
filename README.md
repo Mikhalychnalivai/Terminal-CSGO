@@ -1,4 +1,4 @@
-# DOOM SSH Arena (MVP)
+# CSGO SSH Arena (MVP)
 
 Minimal multiplayer SSH game in Go:
 - `cmd/gateway` - SSH entrypoint and terminal renderer
