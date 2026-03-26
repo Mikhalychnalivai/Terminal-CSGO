@@ -4,6 +4,20 @@ import (
 	"math"
 )
 
+// PlayerStatsData holds player statistics for display in overlay.
+type PlayerStatsData struct {
+	PlayerID      string
+	TotalKills    int
+	TotalDeaths   int
+	ShotsFired    int
+	ShotsHit      int
+	Accuracy      float64
+	PistolKills   int
+	RifleKills    int
+	TotalPlaytime int
+	LastSeen      string
+}
+
 // Цвета пистолета на HUD (часть глифов в pistol_hud.go; см. также PistolHUDBrownBeigeBlend).
 var (
 	PistolHUDBrown = RGBPacked(140, 130, 125) // символ '#'
@@ -84,6 +98,10 @@ type GunHUDState struct {
 	BuyMenuOpen bool
 	// ScoreboardOpen — таблица игроков (Tab).
 	ScoreboardOpen bool
+	// StatsOverlayOpen — персональная статистика игрока (P).
+	StatsOverlayOpen bool
+	// CachedStats — кэшированная статистика для отображения.
+	CachedStats *PlayerStatsData
 	// PingRTTms — измеренный RTT до room (мс), по эхо ping в state.
 	PingRTTMs int
 	// StateLagMs — мс с последнего state на клиенте; в табе показывается как ~N, если RTT ещё не измерен.

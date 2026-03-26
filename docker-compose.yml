@@ -1,21 +1,24 @@
 volumes:
   # Общий том для JSON карт: room-manager пишет файл, room монтирует read-only.
   room_maps:
-    name: doom_ssh_room_maps
+    name: shooter_room_maps
+  # Том для хранения базы данных статистики.
+  stats_data:
+    name: shooter_stats_data
 
 services:
   room-manager:
     build:
       context: .
       dockerfile: Dockerfile
-    image: doom-ssh-arena:latest
+    image: shooter-arena:latest
     command: ["/usr/local/bin/room-manager"]
     environment:
       MANAGER_ADDR: ":8080"
-      ROOM_IMAGE: "doom-ssh-arena:latest"
+      ROOM_IMAGE: "shooter-arena:latest"
       DOCKER_NETWORK: "hack2026mart_default"
       # Имя docker volume (см. volumes.room_maps.name) — для карт из SSH-редактора.
-      ROOM_MAPS_DOCKER_VOLUME: "doom_ssh_room_maps"
+      ROOM_MAPS_DOCKER_VOLUME: "shooter_room_maps"
       ROOM_MAPS_DIR: "/data/maps"
       # Карта по умолчанию — corridor5 (см. DEFAULT_MAP_ID / map_id в API).
       DEFAULT_MAP_ID: "corridor5"
@@ -27,11 +30,16 @@ services:
       # Интервал state в мс для контейнеров room (меньше = отзывчивее, больше нагрузка)
       ROOM_TICK_MS: "16"
       DOCKER_HOST: "unix:///var/run/docker.sock"
+      # Statistics database configuration
+      STATS_ENABLED: "true"
+      STATS_DB_PATH: "/data/stats.db"
     volumes:
       - "/var/run/docker.sock:/var/run/docker.sock"
       - "room_maps:/data/maps"
+      - "stats_data:/data"
     ports:
       - "8080:8080"
+      - "8081:8081"
     user: "0:0"
     restart: unless-stopped
 
@@ -39,7 +47,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: doom-ssh-arena:latest
+    image: shooter-arena:latest
     command: ["/usr/local/bin/gateway"]
     environment:
       SSH_LISTEN_ADDR: ":2222"

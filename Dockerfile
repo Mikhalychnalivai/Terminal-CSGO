@@ -23,7 +23,7 @@ RUN go mod tidy && \
     CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /out/room-manager ./cmd/room-manager
 
 FROM ${ALPINE_IMAGE} AS runtime
-RUN apk add --no-cache docker-cli && adduser -D appuser
+RUN apk add --no-cache docker-cli sqlite && adduser -D appuser
 WORKDIR /app
 COPY --from=builder /out/gateway /usr/local/bin/gateway
 COPY --from=builder /out/room /usr/local/bin/room

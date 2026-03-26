@@ -2,6 +2,7 @@ package room
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
@@ -20,12 +21,14 @@ import (
 	"hack2026mart/internal/game/navmesh"
 	"hack2026mart/internal/game/protocol"
 	"hack2026mart/internal/game/render"
+	"hack2026mart/internal/game/stats"
 	"hack2026mart/internal/game/wad"
 )
 
 type Server struct {
-	addr string
-	room *Room
+	addr      string
+	room      *Room
+	collector stats.Collector
 }
 
 type Room struct {
@@ -46,6 +49,7 @@ type Room struct {
 	players     map[string]*Player
 	// killFeed — последние события для килчата (только имена).
 	killFeed []protocol.KillFeedEntry
+	server   *Server // ссылка на сервер для доступа к collector
 	mu       sync.RWMutex
 }
 
@@ -88,10 +92,12 @@ func NewServer(addr string, roomID string, wadPath string, mapName string) (*Ser
 	if err != nil {
 		return nil, err
 	}
-	return &Server{
+	srv := &Server{
 		addr: addr,
 		room: baseRoom,
-	}, nil
+	}
+	baseRoom.server = srv
+	return srv, nil
 }
 
 // NewServerFromJSON загружает карту из JSON (каталог map/ в репозитории), а не из WAD.
@@ -100,10 +106,17 @@ func NewServerFromJSON(addr string, roomID string, jsonPath string) (*Server, er
 	if err != nil {
 		return nil, err
 	}
-	return &Server{
+	srv := &Server{
 		addr: addr,
 		room: baseRoom,
-	}, nil
+	}
+	baseRoom.server = srv
+	return srv, nil
+}
+
+// SetStatsCollector устанавливает коллектор статистики для сервера.
+func (s *Server) SetStatsCollector(collector stats.Collector) {
+	s.collector = collector
 }
 
 func (s *Server) Run() error {
@@ -169,8 +182,32 @@ func (s *Server) handleConn(conn net.Conn) {
 		sendFullMap: true,
 	}
 
+	// Record session start
+	sessionStart := time.Now()
+	if s.collector != nil {
+		go s.collector.RecordSession(context.Background(), stats.SessionEvent{
+			PlayerID:  playerID,
+			RoomID:    r.id,
+			MapID:     r.mapTitle,
+			EventType: "start",
+			Timestamp: sessionStart,
+		})
+	}
+
 	r.addPlayer(p)
-	defer r.removePlayer(playerID)
+	defer func() {
+		r.removePlayer(playerID)
+		// Record session end
+		if s.collector != nil {
+			go s.collector.RecordSession(context.Background(), stats.SessionEvent{
+				PlayerID:  playerID,
+				RoomID:    r.id,
+				MapID:     r.mapTitle,
+				EventType: "end",
+				Timestamp: time.Now(),
+			})
+		}
+	}()
 
 	wb := protocol.EncodeWelcome(protocol.WelcomePayload{
 		PlayerID:  playerID,
@@ -877,7 +914,25 @@ func (r *Room) tryFireLocked(shooter *Player, weapon int) {
 		shooter.pistolMag--
 	}
 
+	weaponType := render.HUDWeaponPistol
+	if isRifle {
+		weaponType = render.HUDWeaponRifle
+	}
+
 	target := r.traceHitPlayer(shooter)
+	hit := target != nil
+
+	// Record shot event
+	if r.server != nil && r.server.collector != nil {
+		go r.server.collector.RecordShot(context.Background(), stats.ShotEvent{
+			PlayerID:   shooter.id,
+			RoomID:     r.id,
+			WeaponType: weaponType,
+			Hit:        hit,
+			Timestamp:  time.Now(),
+		})
+	}
+
 	if target == nil {
 		return
 	}
@@ -894,6 +949,17 @@ func (r *Room) tryFireLocked(shooter *Player, weapon int) {
 		shooter.money += render.KillRewardMoney
 		shooter.kills++
 		target.deaths++
+
+		// Record kill event
+		if r.server != nil && r.server.collector != nil {
+			go r.server.collector.RecordKill(context.Background(), stats.KillEvent{
+				KillerID:   shooter.id,
+				VictimID:   target.id,
+				RoomID:     r.id,
+				WeaponType: weaponType,
+				Timestamp:  time.Now(),
+			})
+		}
 	}
 }
 

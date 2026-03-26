@@ -23,6 +23,7 @@ import (
 	"hack2026mart/internal/game/nav"
 	"hack2026mart/internal/game/protocol"
 	"hack2026mart/internal/game/render"
+	"hack2026mart/internal/game/stats"
 	"hack2026mart/internal/mapedit"
 )
 
@@ -64,6 +65,52 @@ func normalizeAngleRad(a float64) float64 {
 // predKey — тот же упакованный ключ клетки, что render.wallKey / nav.CellKey (без fmt).
 func predKey(x, y int) uint64 {
 	return nav.CellKey(x, y)
+}
+
+// statsCache holds cached player statistics with TTL.
+type statsCache struct {
+	mu        sync.Mutex
+	data      *stats.PlayerStats
+	timestamp time.Time
+	ttl       time.Duration
+}
+
+// fetchPlayerStats retrieves player statistics from the room-manager API.
+// Uses cache if data is fresh (< TTL), otherwise makes HTTP request.
+func fetchPlayerStats(managerAddr, playerID string, cache *statsCache) (*stats.PlayerStats, error) {
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+
+	// Check cache
+	if cache.data != nil && time.Since(cache.timestamp) < cache.ttl {
+		return cache.data, nil
+	}
+
+	// Make HTTP request
+	url := fmt.Sprintf("%s/stats/player/%s", managerAddr, playerID)
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("HTTP GET failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, fmt.Errorf("player not found")
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("server returned status %d", resp.StatusCode)
+	}
+
+	var playerStats stats.PlayerStats
+	if err := json.NewDecoder(resp.Body).Decode(&playerStats); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	// Update cache
+	cache.data = &playerStats
+	cache.timestamp = time.Now()
+
+	return &playerStats, nil
 }
 
 func main() {
@@ -406,6 +453,7 @@ func handleSession(s gossh.Session, managerAddr string) {
 		if n == 1 && last == 27 { // одиночный Esc — закрыть оверлеи (не путать с \x1b[… стрелок)
 			cv.scoreboardOpen.Store(false)
 			cv.buyMenuOpen.Store(false)
+			cv.statsOverlayOpen.Store(false)
 			continue
 		}
 		if hasTab {
@@ -424,6 +472,50 @@ func handleSession(s gossh.Session, managerAddr string) {
 				cv.scoreboardOpen.Store(!cv.scoreboardOpen.Load())
 				if cv.scoreboardOpen.Load() {
 					cv.buyMenuOpen.Store(false)
+					cv.statsOverlayOpen.Store(false)
+				}
+			}
+			continue
+		}
+		if key == "p" {
+			cv.mu.Lock()
+			dead := false
+			if cv.snap != nil {
+				for _, pl := range cv.snap.Players {
+					if pl.ID == playerID {
+						dead = pl.Dead
+						break
+					}
+				}
+			}
+			cv.mu.Unlock()
+			if !dead {
+				cv.statsOverlayOpen.Store(!cv.statsOverlayOpen.Load())
+				if cv.statsOverlayOpen.Load() {
+					cv.buyMenuOpen.Store(false)
+					cv.scoreboardOpen.Store(false)
+					// Fetch stats in background
+					go func() {
+						statsCache := &statsCache{ttl: 5 * time.Second}
+						playerStats, err := fetchPlayerStats(managerAddr, playerID, statsCache)
+						if err == nil {
+							// Convert to render.PlayerStatsData
+							cv.mu.Lock()
+							cv.cachedStats = &render.PlayerStatsData{
+								PlayerID:      playerStats.PlayerID,
+								TotalKills:    playerStats.TotalKills,
+								TotalDeaths:   playerStats.TotalDeaths,
+								ShotsFired:    playerStats.ShotsFired,
+								ShotsHit:      playerStats.ShotsHit,
+								Accuracy:      playerStats.Accuracy,
+								PistolKills:   playerStats.PistolKills,
+								RifleKills:    playerStats.RifleKills,
+								TotalPlaytime: playerStats.TotalPlaytime,
+								LastSeen:      playerStats.LastSeen,
+							}
+							cv.mu.Unlock()
+						}
+					}()
 				}
 			}
 			continue
@@ -719,6 +811,8 @@ type clientView struct {
 	localPistolMag atomic.Int32
 	buyMenuOpen       atomic.Bool
 	scoreboardOpen    atomic.Bool
+	statsOverlayOpen  atomic.Bool
+	cachedStats       *render.PlayerStatsData
 	pendingPingNano   atomic.Int64
 	lastPingSendWall  atomic.Int64 // wall clock при отправке ping (сброс зависшего ожидания эха)
 	pingRTTms         atomic.Int32
@@ -1034,6 +1128,10 @@ func (cv *clientView) paintFrame(
 	}
 	walking := lastMoveNano > 0 && (nan-lastMoveNano) < 180_000_000
 
+	cv.mu.Lock()
+	cachedStatsData := cv.cachedStats
+	cv.mu.Unlock()
+
 	hud := render.GunHUDState{
 		FireStartUnixNano:   fireNano.Load(),
 		ReloadStartUnixNano: rs,
@@ -1045,6 +1143,8 @@ func (cv *clientView) paintFrame(
 		DamageFlashUntilUnixNano: damageUntil,
 		BuyMenuOpen:              cv.buyMenuOpen.Load(),
 		ScoreboardOpen:           cv.scoreboardOpen.Load(),
+		StatsOverlayOpen:         cv.statsOverlayOpen.Load(),
+		CachedStats:              cachedStatsData,
 		PingRTTMs:                int(cv.pingRTTms.Load()),
 		StateLagMs:               lagMs,
 		MoneyGainFlashUntilUnixNano: moneyGainUntil,

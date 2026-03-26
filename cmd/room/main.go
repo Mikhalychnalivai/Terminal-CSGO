@@ -4,8 +4,10 @@ import (
 	"log"
 	"os"
 	"strings"
+	"time"
 
 	"hack2026mart/internal/game/room"
+	"hack2026mart/internal/game/stats"
 )
 
 func main() {
@@ -14,6 +16,25 @@ func main() {
 	jsonMapPath := strings.TrimSpace(os.Getenv("JSON_MAP_PATH"))
 	wadPath := getenv("WAD_PATH", "")
 	mapName := getenv("WAD_MAP", "E1M2")
+
+	// Initialize statistics collector
+	statsEnabled := getenv("STATS_ENABLED", "true") == "true"
+	var collector stats.Collector
+	if statsEnabled {
+		statsEndpoint := getenv("STATS_ENDPOINT", "http://room-manager:8081/stats/events")
+		collector = stats.NewCollector(stats.CollectorConfig{
+			RoomID:        roomID,
+			Endpoint:      statsEndpoint,
+			BufferSize:    1000,
+			FlushInterval: 1 * time.Second,
+			FlushBatch:    100,
+		})
+		defer collector.Close()
+		log.Printf("statistics collector enabled, endpoint: %s", statsEndpoint)
+	} else {
+		collector = stats.NewNoopCollector()
+		log.Println("statistics collector disabled")
+	}
 
 	var srv *room.Server
 	var err error
@@ -29,6 +50,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("room init failed: %v", err)
 	}
+
+	// Inject collector into room server
+	srv.SetStatsCollector(collector)
+
 	if err := srv.Run(); err != nil {
 		log.Fatalf("room server failed: %v", err)
 	}

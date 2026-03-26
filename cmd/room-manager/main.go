@@ -13,11 +13,16 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"hack2026mart/internal/game/stats"
 )
 
 type manager struct {
-	roomImage string
-	network   string
+	roomImage    string
+	network      string
+	statsAPI     *stats.API
+	statsDB      *stats.Database
+	statsEnabled bool
 }
 
 type roomRequest struct {
@@ -34,9 +39,40 @@ type roomResponse struct {
 }
 
 func main() {
+	statsEnabled := getenv("STATS_ENABLED", "true") == "true"
+
 	m := &manager{
-		roomImage: getenv("ROOM_IMAGE", "doom-ssh-arena:latest"),
-		network:   getenv("DOCKER_NETWORK", "hack2026mart_default"),
+		roomImage:    getenv("ROOM_IMAGE", "shooter-arena:latest"),
+		network:      getenv("DOCKER_NETWORK", "hack2026mart_default"),
+		statsEnabled: statsEnabled,
+	}
+
+	// Initialize statistics database and API
+	if statsEnabled {
+		dbPath := getenv("STATS_DB_PATH", "/data/stats.db")
+		
+		// Create directory if it doesn't exist
+		dir := filepath.Dir(dbPath)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			log.Fatalf("failed to create stats directory: %v", err)
+		}
+
+		db, err := stats.NewDatabase(dbPath)
+		if err != nil {
+			log.Fatalf("failed to initialize statistics database: %v", err)
+		}
+		m.statsDB = db
+		defer db.Close()
+
+		api, err := stats.NewAPI(db)
+		if err != nil {
+			log.Fatalf("failed to initialize statistics API: %v", err)
+		}
+		m.statsAPI = api
+		defer api.Close()
+		log.Printf("statistics database initialized at %s", dbPath)
+	} else {
+		log.Println("statistics disabled")
 	}
 
 	mux := http.NewServeMux()
@@ -46,6 +82,11 @@ func main() {
 	})
 	mux.HandleFunc("/rooms/create", m.handleCreate)
 	mux.HandleFunc("/rooms/get", m.handleGet)
+
+	// Mount statistics API if enabled
+	if statsEnabled && m.statsAPI != nil {
+		mux.HandleFunc("/stats/", m.statsAPI.ServeHTTP)
+	}
 
 	addr := getenv("MANAGER_ADDR", ":8080")
 	log.Printf("room-manager listening at %s", addr)
@@ -128,6 +169,18 @@ func (m *manager) ensureRoom(req roomRequest) (string, error) {
 		"-e", "ROOM_ID=" + roomID,
 		"-e", "ROOM_TICK_MS=" + tickMS,
 	}
+
+	// Pass statistics configuration to room containers
+	if m.statsEnabled {
+		statsEndpoint := "http://room-manager:8080/stats/events"
+		args = append(args,
+			"-e", "STATS_ENABLED=true",
+			"-e", "STATS_ENDPOINT="+statsEndpoint,
+		)
+	} else {
+		args = append(args, "-e", "STATS_ENABLED=false")
+	}
+
 	if v := strings.TrimSpace(os.Getenv("ROOM_STATE_GZIP")); v != "" {
 		args = append(args, "-e", "ROOM_STATE_GZIP="+v)
 	}
@@ -135,9 +188,9 @@ func (m *manager) ensureRoom(req roomRequest) (string, error) {
 		args = append(args, "-e", "ROOM_GZIP_MIN_BYTES="+v)
 	}
 	args = append(args,
-		"-e", "SPAWN_COUNT=" + spawnCount,
-		"-e", "SPAWN_MIN_DIST=" + spawnMinDist,
-		"-e", "SPAWN_SYMMETRY=" + spawnSymmetry,
+		"-e", "SPAWN_COUNT="+spawnCount,
+		"-e", "SPAWN_MIN_DIST="+spawnMinDist,
+		"-e", "SPAWN_SYMMETRY="+spawnSymmetry,
 	)
 
 	switch mapID {

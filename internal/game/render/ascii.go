@@ -95,6 +95,9 @@ func Frame(playerID string, snap *protocol.RoomSnapshot, hud GunHUDState, termW 
 	if hud.ScoreboardOpen {
 		drawScoreboardOverlay(scene, colors, snap, playerID, hud, viewW, viewH)
 	}
+	if hud.StatsOverlayOpen {
+		drawStatsOverlay(scene, colors, hud, viewW, viewH)
+	}
 
 	var b strings.Builder
 	b.Grow(viewW * viewH * 24)
@@ -1500,5 +1503,159 @@ func drawKillFeed(scene [][]rune, colors [][]uint32, feed []protocol.KillFeedEnt
 			colors[y][xx] = RGBPacked(255, 245, 230)
 		}
 		y++
+	}
+}
+
+
+// drawStatsOverlay — персональная статистика игрока (клавиша P).
+// Показывает: убийства, смерти, K/D, точность, выстрелы, время игры.
+func drawStatsOverlay(scene [][]rune, colors [][]uint32, hud GunHUDState, viewW, viewH int) {
+	h := len(scene)
+	if h < 12 || viewW < 40 {
+		return
+	}
+
+	boxW := 52
+	boxH := 16
+	if boxW > viewW-4 {
+		boxW = viewW - 4
+	}
+	if boxH > h-4 {
+		boxH = h - 4
+	}
+	startX := (viewW - boxW) / 2
+	startY := (h - boxH) / 2
+
+	// Черный фон для всего окна
+	blackBg := RGBPacked(0, 0, 0)
+	for y := startY; y < startY+boxH && y < h; y++ {
+		for x := startX; x < startX+boxW && x < viewW; x++ {
+			if y >= 0 && x >= 0 {
+				scene[y][x] = ' '
+				colors[y][x] = blackBg
+			}
+		}
+	}
+
+	// Рамка
+	frameCol := RGBPacked(180, 180, 200)
+	for x := startX; x < startX+boxW && x < viewW; x++ {
+		if startY >= 0 && startY < h {
+			scene[startY][x] = '─'
+			colors[startY][x] = frameCol
+		}
+		if startY+boxH-1 >= 0 && startY+boxH-1 < h {
+			scene[startY+boxH-1][x] = '─'
+			colors[startY+boxH-1][x] = frameCol
+		}
+	}
+	for y := startY; y < startY+boxH && y < h; y++ {
+		if startX >= 0 && startX < viewW {
+			scene[y][startX] = '│'
+			colors[y][startX] = frameCol
+		}
+		if startX+boxW-1 >= 0 && startX+boxW-1 < viewW {
+			scene[y][startX+boxW-1] = '│'
+			colors[y][startX+boxW-1] = frameCol
+		}
+	}
+	// Углы
+	if startY >= 0 && startY < h && startX >= 0 && startX < viewW {
+		scene[startY][startX] = '┌'
+		colors[startY][startX] = frameCol
+	}
+	if startY >= 0 && startY < h && startX+boxW-1 >= 0 && startX+boxW-1 < viewW {
+		scene[startY][startX+boxW-1] = '┐'
+		colors[startY][startX+boxW-1] = frameCol
+	}
+	if startY+boxH-1 >= 0 && startY+boxH-1 < h && startX >= 0 && startX < viewW {
+		scene[startY+boxH-1][startX] = '└'
+		colors[startY+boxH-1][startX] = frameCol
+	}
+	if startY+boxH-1 >= 0 && startY+boxH-1 < h && startX+boxW-1 >= 0 && startX+boxW-1 < viewW {
+		scene[startY+boxH-1][startX+boxW-1] = '┘'
+		colors[startY+boxH-1][startX+boxW-1] = frameCol
+	}
+
+	// Заголовок
+	title := " PERSONAL STATISTICS "
+	titleX := startX + (boxW-len(title))/2
+	titleCol := RGBPacked(255, 220, 100)
+	for i, ch := range title {
+		x := titleX + i
+		if x >= 0 && x < viewW && startY+1 >= 0 && startY+1 < h {
+			scene[startY+1][x] = ch
+			colors[startY+1][x] = titleCol
+		}
+	}
+
+	textCol := RGBPacked(200, 200, 200)
+
+	var lines []string
+	if hud.CachedStats == nil {
+		lines = []string{
+			"",
+			"  Loading statistics...",
+			"",
+			"  Press P or ESC to close",
+		}
+	} else {
+		s := hud.CachedStats
+		kd := "N/A"
+		if s.TotalDeaths > 0 {
+			kd = fmt.Sprintf("%.2f", float64(s.TotalKills)/float64(s.TotalDeaths))
+		} else if s.TotalKills > 0 {
+			kd = fmt.Sprintf("%.2f", float64(s.TotalKills))
+		}
+		
+		hours := s.TotalPlaytime / 3600
+		minutes := (s.TotalPlaytime % 3600) / 60
+		seconds := s.TotalPlaytime % 60
+		playtime := fmt.Sprintf("%02d:%02d:%02d", hours, minutes, seconds)
+
+		lines = []string{
+			"",
+			fmt.Sprintf("  Kills:        %d", s.TotalKills),
+			fmt.Sprintf("  Deaths:       %d", s.TotalDeaths),
+			fmt.Sprintf("  K/D Ratio:    %s", kd),
+			"",
+			fmt.Sprintf("  Shots Fired:  %d", s.ShotsFired),
+			fmt.Sprintf("  Shots Hit:    %d", s.ShotsHit),
+			fmt.Sprintf("  Accuracy:     %.1f%%", s.Accuracy*100),
+			"",
+			fmt.Sprintf("  Pistol Kills: %d", s.PistolKills),
+			fmt.Sprintf("  Rifle Kills:  %d", s.RifleKills),
+			"",
+			fmt.Sprintf("  Playtime:     %s", playtime),
+		}
+	}
+
+	y := startY + 3
+	for _, line := range lines {
+		if y >= h || y >= startY+boxH-1 {
+			break
+		}
+		x := startX + 1
+		for _, ch := range line {
+			if x >= viewW-1 || x >= startX+boxW-1 {
+				break
+			}
+			scene[y][x] = ch
+			colors[y][x] = textCol
+			x++
+		}
+		y++
+	}
+
+	// Подсказка внизу
+	hint := "Press P or ESC to close"
+	hintX := startX + (boxW-len(hint))/2
+	hintCol := RGBPacked(140, 140, 160)
+	for i, ch := range hint {
+		x := hintX + i
+		if x >= 0 && x < viewW && startY+boxH-2 >= 0 && startY+boxH-2 < h {
+			scene[startY+boxH-2][x] = ch
+			colors[startY+boxH-2][x] = hintCol
+		}
 	}
 }
